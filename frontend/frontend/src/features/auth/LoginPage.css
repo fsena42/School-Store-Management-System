@@ -1,0 +1,122 @@
+
+.login-shell {
+  min-height: 100vh;
+  display: grid;
+  place-items: center;
+  padding: 28px 16px;
+  background:
+    radial-gradient(circle at top left, #e1eaff 0, transparent 42%),
+    #f3f6fb;
+  color: #172033;
+  font-family: Inter, "Segoe UI", Arial, sans-serif;
+}
+
+.login-card {
+  box-sizing: border-box;
+  width: 100%;
+  max-width: 440px;
+  padding: 38px;
+  background: #fff;
+  border: 1px solid #e5eaf2;
+  border-radius: 20px;
+  box-shadow: 0 18px 55px rgba(29, 50, 87, 0.09);
+}
+
+.login-brand {
+  width: 54px;
+  height: 54px;
+  display: grid;
+  place-items: center;
+  margin-bottom: 24px;
+  border-radius: 15px;
+  background: #173f82;
+  color: #fff;
+  font-weight: 800;
+}
+
+.login-eyebrow {
+  margin-bottom: 12px;
+  color: #4267a7;
+  font-size: 11px;
+  font-weight: 800;
+  letter-spacing: 1.4px;
+}
+
+.login-card h1 {
+  margin: 0;
+  font-size: 30px;
+}
+
+.login-subtitle {
+  margin: 10px 0 28px;
+  color: #68758b;
+  font-size: 14px;
+  line-height: 1.6;
+}
+
+.login-card form {
+  display: flex;
+  flex-direction: column;
+}
+
+.login-card label {
+  margin-bottom: 8px;
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.login-card input {
+  box-sizing: border-box;
+  width: 100%;
+  margin-bottom: 20px;
+  padding: 13px 14px;
+  border: 1px solid #d8dfeb;
+  border-radius: 9px;
+  outline: none;
+  font: inherit;
+}
+
+.login-card input:focus {
+  border-color: #3869b2;
+  box-shadow: 0 0 0 3px rgba(56, 105, 178, 0.12);
+}
+
+.login-card button {
+  padding: 14px;
+  border: 0;
+  border-radius: 9px;
+  background: #173f82;
+  color: #fff;
+  font: inherit;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.login-card button:hover {
+  background: #102f64;
+}
+
+.login-card button:disabled {
+  opacity: 0.7;
+  cursor: wait;
+}
+
+.login-error {
+  color: #b42318;
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.login-footer {
+  margin-top: 24px;
+  color: #7a8598;
+  font-size: 12px;
+  line-height: 1.6;
+  text-align: center;
+}
+
+@media (max-width: 480px) {
+  .login-card {
+    padding: 28px 22px;
+  }
+}

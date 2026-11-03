@@ -1,0 +1,158 @@
+
+.management-page {
+  padding: 24px;
+  color: #1f2937;
+}
+
+.management-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 16px;
+  flex-wrap: wrap;
+  margin-bottom: 24px;
+}
+
+.management-header h1 {
+  margin: 0 0 8px;
+}
+
+.management-header p {
+  margin: 0;
+  color: #64748b;
+}
+
+.management-back,
+.management-tabs button,
+.management-form button {
+  border: 0;
+  border-radius: 8px;
+  padding: 11px 16px;
+  cursor: pointer;
+  font: inherit;
+}
+
+.management-back {
+  background: #e2e8f0;
+  color: #1e293b;
+}
+
+.management-tabs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin-bottom: 24px;
+  border-bottom: 1px solid #e2e8f0;
+  padding-bottom: 12px;
+}
+
+.management-tabs button {
+  background: #f1f5f9;
+  color: #334155;
+}
+
+.management-tabs button.active {
+  background: #1d4ed8;
+  color: white;
+}
+
+.management-section {
+  background: white;
+  border: 1px solid #e2e8f0;
+  border-radius: 12px;
+  padding: 22px;
+  margin-bottom: 24px;
+}
+
+.management-section h2 {
+  margin-top: 0;
+}
+
+.management-section h3 {
+  margin-top: 30px;
+}
+
+.management-form {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 16px;
+}
+
+.management-form label {
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+  font-weight: 600;
+}
+
+.management-form input,
+.management-form select {
+  box-sizing: border-box;
+  width: 100%;
+  min-width: 0;
+  padding: 11px;
+  border: 1px solid #cbd5e1;
+  border-radius: 7px;
+  background: white;
+  color: #1f2937;
+  font: inherit;
+}
+
+.management-form button {
+  align-self: end;
+  background: #1d4ed8;
+  color: white;
+  font-weight: 600;
+}
+
+.management-form button:disabled {
+  opacity: 0.6;
+  cursor: wait;
+}
+
+.management-error {
+  color: #b91c1c;
+  margin-top: 16px;
+}
+
+.management-success {
+  color: #166534;
+  margin-top: 16px;
+}
+
+.management-table-wrap {
+  width: 100%;
+  overflow-x: auto;
+}
+
+.management-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 14px;
+}
+
+.management-table th,
+.management-table td {
+  text-align: left;
+  padding: 12px;
+  border-bottom: 1px solid #e2e8f0;
+  white-space: nowrap;
+}
+
+.management-table th {
+  background: #f8fafc;
+}
+
+@media (max-width: 650px) {
+  .management-page {
+    padding: 14px;
+  }
+
+  .management-section {
+    padding: 14px;
+  }
+
+  .management-form {
+    grid-template-columns: 1fr;
+  }
+}
