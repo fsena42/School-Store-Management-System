@@ -146,7 +146,7 @@ function DashboardPage({ onLogout }) {
     )
   }
 
-  // Fixed: use the position name, not staff.position_id.
+
   if (currentPage === 'management' && canManage) {
     return (
       <ManagementPage
