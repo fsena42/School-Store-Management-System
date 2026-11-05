@@ -3,6 +3,7 @@ from datetime import date
 
 from django.contrib.auth import authenticate, login
 from django.db import transaction
+from django.db.models import Exists, OuterRef
 
 from django.middleware.csrf import get_token
 from django.views.decorators.csrf import ensure_csrf_cookie
@@ -226,10 +227,37 @@ def inventory_list(request):
 
     items = Item.objects.select_related(
         "storeid", "unitid"
+    ).annotate(
+        has_request_history=Exists(
+            RequestItem.objects.filter(itemid_id=OuterRef("itemid"))
+        ),
+        has_procurement_history=Exists(
+            PurchaseItem.objects.filter(itemid_id=OuterRef("itemid"))
+        ),
+        has_audit_history=Exists(
+            InventoryAudit.objects.filter(item_id=OuterRef("itemid"))
+        ),
     ).order_by("itemid")
 
     results = []
     for item in items:
+        if item.has_request_history:
+            delete_block_reason = (
+                "This item cannot be deleted because it has request history."
+            )
+        elif item.has_procurement_history:
+            delete_block_reason = (
+                "This item cannot be deleted because it has procurement history."
+            )
+        elif item.has_audit_history:
+            delete_block_reason = (
+                "This item cannot be deleted because it has audit history."
+            )
+        elif item.quantity != 0:
+            delete_block_reason = "Only items with zero stock can be deleted."
+        else:
+            delete_block_reason = None
+
         results.append({
             "item_id": item.itemid,
             "item_name": item.itemname,
@@ -238,6 +266,7 @@ def inventory_list(request):
             "unit_id": item.unitid_id,
             "quantity": item.quantity,
             "reorder_level": item.reorderlevel,
+            "delete_block_reason": delete_block_reason,
         })
 
     return Response({

@@ -158,6 +158,13 @@ function InventoryPage({ onBack }) {
 
       {!error && (
         <>
+          {canManageInventory && (
+            <p className="inventory-delete-guidance" role="note">
+              Items can be deleted only when their stock is zero and they
+              have no request, purchase, or audit history.
+            </p>
+          )}
+
           <section className="inventory-summary">
             <div>
               <span>Total item records</span>
@@ -251,7 +258,10 @@ function InventoryPage({ onBack }) {
                           {' '}
                           <button
                             type="button"
-                            className="inventory-secondary, red-button"
+                            className="inventory-secondary inventory-delete"
+                            disabled={Boolean(item.delete_block_reason)}
+                            title={item.delete_block_reason || 'Delete item'}
+                            aria-label={`Delete ${item.item_name}`}
                             onClick={() => {
                               setDeletingItem(item)
                               setActionMessage('')
@@ -260,6 +270,14 @@ function InventoryPage({ onBack }) {
                           >
                             Delete
                           </button>
+                          {item.delete_block_reason && (
+                            <span
+                              className="inventory-delete-reason"
+                              title={item.delete_block_reason}
+                            >
+                              {item.delete_block_reason}
+                            </span>
+                          )}
                         </td>
                       )}
                     </tr>

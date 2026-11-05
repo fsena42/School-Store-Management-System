@@ -52,6 +52,17 @@
   margin-bottom: 24px;
 }
 
+.inventory-delete-guidance {
+  margin: -8px 0 20px;
+  padding: 12px 16px;
+  border: 1px solid #d6e2f5;
+  border-radius: 9px;
+  background: #edf4ff;
+  color: #354d73;
+  font-size: 14px;
+  line-height: 1.5;
+}
+
 .inventory-summary div {
   flex: 1;
   min-width: 170px;
@@ -277,4 +288,14 @@
 .inventory-table button:disabled {
   opacity: 0.5;
   cursor: not-allowed;
+}
+
+.inventory-table .inventory-delete-reason {
+  display: block;
+  max-width: 260px;
+  margin-top: 6px;
+  color: #647084;
+  font-size: 12px;
+  line-height: 1.4;
+  white-space: normal;
 }
