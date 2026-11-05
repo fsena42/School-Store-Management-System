@@ -1,6 +1,6 @@
 
 from rest_framework import serializers
-from .models import Request, RequestItem, Store, Item, ItemArchive
+from .models import Request, RequestItem, Store, Item
 from .permissions import REQUESTABLE_STORES_BY_POSITION
 
 
@@ -64,10 +64,7 @@ class RequestSerializer(serializers.Serializer):
                         "to the selected store."
                     )
                 })
-            latest_archive = ItemArchive.objects.filter(
-                item_id=item.itemid
-            ).order_by("-archived_at", "-pk").first()
-            if latest_archive and latest_archive.action == "ARCHIVED":
+            if item.is_archived:
                 raise serializers.ValidationError({
                     "items": f"Archived item '{item.itemname}' cannot be requested."
                 })
