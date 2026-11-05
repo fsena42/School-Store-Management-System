@@ -16,9 +16,6 @@ function ApprovalsPage({ onBack }) {
   const [message, setMessage] = useState('')
 
   const loadRequests = useCallback(async () => {
-    setLoading(true)
-    setError('')
-
     try {
       const data = await apiRequest('/pending-requests/')
       const pending = data.requests || []
@@ -48,8 +45,43 @@ function ApprovalsPage({ onBack }) {
   }, [])
 
   useEffect(() => {
-    loadRequests()
-  }, [loadRequests])
+    let active = true
+
+    async function loadInitialRequests() {
+      try {
+        const data = await apiRequest('/pending-requests/')
+        if (!active) return
+
+        const pending = data.requests || []
+        setRequests(pending)
+        setQuantities((previous) => {
+          const next = {}
+
+          for (const req of pending) {
+            next[req.request_id] = {}
+            for (const item of req.items) {
+              next[req.request_id][item.request_item_id] =
+                previous[req.request_id]?.[item.request_item_id] ??
+                item.quantity_requested
+            }
+          }
+
+          return next
+        })
+      } catch (err) {
+        if (active) {
+          setError(err.message || 'Could not load pending requests.')
+        }
+      } finally {
+        if (active) setLoading(false)
+      }
+    }
+
+    loadInitialRequests()
+    return () => {
+      active = false
+    }
+  }, [])
 
   const loadPurchaseOrders = useCallback(async () => {
     setLoading(true)

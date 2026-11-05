@@ -348,6 +348,7 @@ function InventoryPage({ onBack }) {
       )}
       {editingItem && (
         <EditItemForm
+          key={editingItem.item_id}
           item={editingItem}
           onSave={handleSaveEdit}
           onCancel={() => setEditingItem(null)}

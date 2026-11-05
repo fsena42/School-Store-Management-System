@@ -31,8 +31,27 @@ export default function SupplierManagement() {
   }, [])
 
   useEffect(() => {
-    loadSuppliers()
-  }, [loadSuppliers])
+    let active = true
+
+    async function loadInitialSuppliers() {
+      try {
+        const result = await apiRequest('/management/suppliers/')
+        if (active) {
+          setSuppliers(result.suppliers)
+          setError('')
+        }
+      } catch (err) {
+        if (active) setError(err.message)
+      } finally {
+        if (active) setLoading(false)
+      }
+    }
+
+    loadInitialSuppliers()
+    return () => {
+      active = false
+    }
+  }, [])
 
   function update(field, value) {
     setForm((previous) => ({ ...previous, [field]: value }))

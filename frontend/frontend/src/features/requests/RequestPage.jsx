@@ -38,7 +38,30 @@ function RequestsPage({ onBack, stores = [] }) {
 
 
   useEffect(() => {
-    loadData()
+    let active = true
+
+    async function loadInitialData() {
+      try {
+        const [itemsData, requestsData] = await Promise.all([
+          apiRequest('/requestable-items/'),
+          apiRequest('/my-requests/'),
+        ])
+        if (!active) return
+        setItems(itemsData.items || [])
+        setRequests(requestsData.requests || [])
+      } catch (err) {
+        if (active) {
+          setError(err.message || 'Could not load request information.')
+        }
+      } finally {
+        if (active) setLoading(false)
+      }
+    }
+
+    loadInitialData()
+    return () => {
+      active = false
+    }
   }, [])
 
   const availableItems = items.filter(

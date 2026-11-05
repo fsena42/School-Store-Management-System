@@ -38,8 +38,32 @@ export default function PurchaseOrdersPage({ onBack }) {
   }, [])
 
   useEffect(() => {
-    loadData()
-  }, [loadData])
+    let active = true
+
+    async function loadInitialData() {
+      try {
+        const [receiving, result] = await Promise.all([
+          apiRequest('/receiving/options/'),
+          apiRequest('/purchase-orders/'),
+        ])
+        if (active) {
+          setOptions(receiving)
+          setOrders(result.purchase_orders || [])
+        }
+      } catch (err) {
+        if (active) {
+          setError(err.message || 'Could not load purchase order data.')
+        }
+      } finally {
+        if (active) setLoading(false)
+      }
+    }
+
+    loadInitialData()
+    return () => {
+      active = false
+    }
+  }, [])
 
   const availableItems = options.items.filter((item) =>
     String(item.store_id) === storeId &&

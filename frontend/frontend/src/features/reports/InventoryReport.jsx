@@ -1,5 +1,5 @@
 
-import { useEffect, useMemo, useState } from 'react'
+import { useMemo, useState } from 'react'
 import { apiRequest } from '../../api/client'
 import {
   ResponsiveContainer,
@@ -14,22 +14,20 @@ import {
   Legend,
 } from 'recharts'
 
+const EMPTY_MOVEMENTS = []
+
 function InventoryReport({ report }) {
   const [fromDate, setFromDate] = useState('')
   const [toDate, setToDate] = useState('')
   const [storeId, setStoreId] = useState('')
-  const [movements, setMovements] = useState(
-    report?.stock_movements ?? []
-  )
+  const [filteredMovements, setFilteredMovements] = useState(null)
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState('')
 
   const stores = report?.stores ?? []
   const stockByStore = report?.stock_by_store ?? []
-
-  useEffect(() => {
-    setMovements(report?.stock_movements ?? [])
-  }, [report])
+  const movements =
+    filteredMovements ?? report?.stock_movements ?? EMPTY_MOVEMENTS
 
   async function applyFilters(event) {
     event.preventDefault()
@@ -52,7 +50,7 @@ function InventoryReport({ report }) {
       const data = await apiRequest(
         `/reports/${query ? `?${query}` : ''}`
       )
-      setMovements(data.stock_movements ?? [])
+      setFilteredMovements(data.stock_movements ?? [])
     } catch (err) {
       setError(err.message || 'Could not load stock movements.')
     } finally {
@@ -65,7 +63,7 @@ function InventoryReport({ report }) {
     setToDate('')
     setStoreId('')
     setError('')
-    setMovements(report?.stock_movements ?? [])
+    setFilteredMovements(null)
   }
 
   const movementByDate = useMemo(() => {

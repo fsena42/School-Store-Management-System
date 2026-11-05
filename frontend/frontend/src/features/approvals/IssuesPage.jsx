@@ -15,8 +15,6 @@ export default function IssuesPage({ onBack }) {
   const [message, setMessage] = useState('')
 
   const loadIssues = useCallback(async () => {
-    setLoading(true)
-    setError('')
     try {
       const data = await apiRequest('/pending-issues/')
       setRequests(data.requests || [])
@@ -54,36 +52,69 @@ export default function IssuesPage({ onBack }) {
   }, [])
 
   useEffect(() => {
-    loadIssues()
-  }, [loadIssues])
+    let active = true
 
-  async function submitIssue(request) {
-    const items = request.items
-      .map((item) => ({
-        request_item_id: item.request_item_id,
-        quantity: Number(quantities[request.request_id]?.[item.request_item_id] || 0),
-      }))
-      .filter((item) => item.quantity > 0)
+    async function loadInitialIssues() {
+      try {
+        const data = await apiRequest('/pending-issues/')
+        if (!active) return
 
-    if (items.length === 0) {
-      setError('Enter an in-stock quantity for at least one item.')
-      return
+        setRequests(data.requests || [])
+        setLegacyReview(data.legacy_review || [])
+        setLegacyValues((previous) => {
+          const next = { ...previous }
+          for (const request of data.legacy_review || []) {
+            next[request.request_id] ||= {}
+            for (const item of request.items) {
+              next[request.request_id][item.request_item_id] ||= {
+                quantity_approved: '',
+                quantity_previously_issued: '',
+              }
+            }
+          }
+          return next
+        })
+        setQuantities((previous) => {
+          const next = {}
+          for (const request of data.requests || []) {
+            next[request.request_id] = {}
+            for (const item of request.items) {
+              next[request.request_id][item.request_item_id] =
+                previous[request.request_id]?.[item.request_item_id] ??
+                Math.min(item.quantity_remaining, item.quantity_in_stock)
+            }
+          }
+          return next
+        })
+      } catch (err) {
+        if (active) {
+          setError(err.message || 'Could not load approved items to issue.')
+        }
+      } finally {
+        if (active) setLoading(false)
+      }
     }
 
-    async function reconcileLegacy(request) {
+    loadInitialIssues()
+    return () => {
+      active = false
+    }
+  }, [])
+
+  async function reconcileLegacy(request) {
       const items = request.items.map((item) => {
         const values = legacyValues[request.request_id]?.[item.request_item_id] || {}
         return {
           request_item_id: item.request_item_id,
-          approvedRaw: values.quantity_approved,
-          issuedRaw: values.quantity_previously_issued,
+          quantity_approved_raw: values.quantity_approved,
+          quantity_previously_issued_raw: values.quantity_previously_issued,
           quantity_approved: Number(values.quantity_approved),
           quantity_previously_issued: Number(values.quantity_previously_issued),
         }
       })
       if (items.some((item) =>
-        item.approvedRaw === '' ||
-        item.issuedRaw === '' ||
+        item.quantity_approved_raw === '' ||
+        item.quantity_previously_issued_raw === '' ||
         !Number.isInteger(item.quantity_approved) ||
         !Number.isInteger(item.quantity_previously_issued) ||
         item.quantity_approved < 0 ||
@@ -93,7 +124,11 @@ export default function IssuesPage({ onBack }) {
         setError('Enter verified whole-number quantities; previously issued cannot exceed approved.')
         return
       }
-      const payloadItems = items.map(({ approvedRaw, issuedRaw, ...item }) => item)
+      const payloadItems = items.map((item) => ({
+        request_item_id: item.request_item_id,
+        quantity_approved: item.quantity_approved,
+        quantity_previously_issued: item.quantity_previously_issued,
+      }))
       const reason = legacyReasons[request.request_id] || ''
       if (!reason.trim()) {
         setError('Describe how the historical quantities were verified.')
@@ -115,6 +150,19 @@ export default function IssuesPage({ onBack }) {
       } finally {
         setBusyId(null)
       }
+  }
+
+  async function submitIssue(request) {
+    const items = request.items
+      .map((item) => ({
+        request_item_id: item.request_item_id,
+        quantity: Number(quantities[request.request_id]?.[item.request_item_id] || 0),
+      }))
+      .filter((item) => item.quantity > 0)
+
+    if (items.length === 0) {
+      setError('Enter an in-stock quantity for at least one item.')
+      return
     }
 
     setBusyId(request.request_id)
@@ -241,7 +289,13 @@ export default function IssuesPage({ onBack }) {
       <section className="approvals-content">
         <div className="approvals-heading">
           <h2>Approved requests awaiting issue ({requests.length})</h2>
-          <button onClick={loadIssues} disabled={loading || busyId !== null}>
+          <button
+            onClick={() => {
+              setLoading(true)
+              loadIssues()
+            }}
+            disabled={loading || busyId !== null}
+          >
             {loading ? 'Refreshing...' : 'Refresh'}
           </button>
         </div>

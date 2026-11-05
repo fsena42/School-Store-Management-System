@@ -142,6 +142,60 @@ class StoreWorkflowTests(TestCase):
         )
         return req, line
 
+    def test_dashboard_and_page_read_apis_work_for_each_role(self):
+        requests_page = [
+            "/api/requestable-items/",
+            "/api/my-requests/",
+        ]
+        principal_pages = [
+            "/api/dashboard/",
+            "/api/inventory/",
+            "/api/pending-requests/",
+            "/api/pending-purchase-orders/",
+            "/api/request-issue-history/",
+            "/api/purchase-orders/",
+            "/api/reports/",
+            "/api/management/staff/",
+            "/api/management/items/",
+            "/api/management/suppliers/",
+        ]
+        manager_pages = [
+            "/api/dashboard/",
+            "/api/inventory/",
+            "/api/pending-issues/",
+            "/api/request-issue-history/",
+            "/api/purchase-orders/",
+            "/api/receiving/options/",
+            "/api/reports/",
+            "/api/management/staff/",
+            "/api/management/items/",
+            "/api/management/suppliers/",
+        ]
+
+        for path in requests_page:
+            response = self.teacher_client.get(path)
+            self.assertEqual(
+                response.status_code,
+                200,
+                f"Teacher GET {path} failed: {response.content[:500]!r}",
+            )
+
+        for path in principal_pages:
+            response = self.principal_client.get(path)
+            self.assertEqual(
+                response.status_code,
+                200,
+                f"Principal GET {path} failed: {response.content[:500]!r}",
+            )
+
+        for path in manager_pages:
+            response = self.manager_client.get(path)
+            self.assertEqual(
+                response.status_code,
+                200,
+                f"Store Manager GET {path} failed: {response.content[:500]!r}",
+            )
+
     def test_approval_is_separate_from_issue_and_issue_updates_stock(self):
         req, line = self.make_request(quantity=4)
         response = self.principal_client.post(

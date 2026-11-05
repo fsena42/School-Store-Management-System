@@ -36,8 +36,27 @@ export default function StaffManagement() {
   }, [])
 
   useEffect(() => {
-    loadStaff()
-  }, [loadStaff])
+    let active = true
+
+    async function loadInitialStaff() {
+      try {
+        const result = await apiRequest('/management/staff/')
+        if (active) {
+          setData(result)
+          setError('')
+        }
+      } catch (err) {
+        if (active) setError(err.message)
+      } finally {
+        if (active) setLoading(false)
+      }
+    }
+
+    loadInitialStaff()
+    return () => {
+      active = false
+    }
+  }, [])
 
   function update(field, value) {
     setForm((previous) => ({ ...previous, [field]: value }))
