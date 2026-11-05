@@ -104,7 +104,7 @@ Do not upload private database credentials or backups to a public repository.
 
 From the backend directory:
 
-```bash
+```bash 
 python manage.py runserver
 ```
 
