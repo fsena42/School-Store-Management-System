@@ -2,6 +2,8 @@
 import { useEffect, useState } from 'react'
 import { apiRequest } from '../../api/client'
 import './InventoryPage.css'
+import EditItemForm from './EditItemForm'
+import DeleteItemDialog from './DeleteItemDialog'
 
 function InventoryPage({ onBack }) {
   const [items, setItems] = useState([])
@@ -10,6 +12,12 @@ function InventoryPage({ onBack }) {
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
   const [canManageInventory, setCanManageInventory] = useState(false)
+  const [editingItem, setEditingItem] = useState(null)
+  const [deletingItem, setDeletingItem] = useState(null)
+  const [savingEdit, setSavingEdit] = useState(false)
+  const [savingDelete, setSavingDelete] = useState(false)
+  const [actionMessage, setActionMessage] = useState('')
+  const [actionError, setActionError] = useState('')
 
   useEffect(() => {
     let active = true
@@ -43,7 +51,68 @@ function InventoryPage({ onBack }) {
       active = false
     }
   }, [])
+  async function handleSaveEdit(formData) {
+    if (!editingItem) return
 
+    setSavingEdit(true)
+    setActionError('')
+    setActionMessage('')
+
+    try {
+      const result = await apiRequest(
+        `/inventory/${editingItem.item_id}/edit/`,
+        {
+          method: 'PATCH',
+          headers: {
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify(formData),
+        }
+      )
+
+      setItems(current =>
+        current.map(item =>
+          item.item_id === result.item.item_id
+            ? { ...item, ...result.item }
+            : item
+        )
+      )
+
+      setEditingItem(null)
+      setActionMessage(result.message)
+    } catch (err) {
+      setActionError(err.message || 'Could not update item.')
+    } finally {
+      setSavingEdit(false)
+    }
+  }
+  async function handleConfirmDelete() {
+    if (!deletingItem) return
+
+    setSavingDelete(true)
+    setActionError('')
+    setActionMessage('')
+
+    try {
+      const result = await apiRequest(
+        `/inventory/${deletingItem.item_id}/delete/`,
+        {
+          method: 'DELETE',
+        }
+      )
+
+      setItems(current =>
+        current.filter(item => item.item_id !== deletingItem.item_id)
+      )
+
+      setDeletingItem(null)
+      setActionMessage(result.message)
+    } catch (err) {
+      setActionError(err.message || 'Could not delete item.')
+    } finally {
+      setSavingDelete(false)
+    }
+  }
   const stores = [...new Map(
     items.map((item) => [
       item.store_id,
@@ -126,7 +195,13 @@ function InventoryPage({ onBack }) {
               ))}
             </select>
           </section>
+          {actionMessage && (
+            <p className="success-message">{actionMessage}</p>
+          )}
 
+          {actionError && (
+            <p className="error-message">{actionError}</p>
+          )}
           <div className="inventory-table-wrap">
             <table className="inventory-table">
               <thead>
@@ -166,9 +241,9 @@ function InventoryPage({ onBack }) {
                             type="button"
                             className="inventory-secondary"
                             onClick={() => {
-                              alert(
-                                `Edit functionality for ${item.item_name} will be connected next.`
-                              )
+                              setEditingItem(item)
+                              setActionMessage('')
+                              setActionError('')
                             }}
                           >
                             Edit
@@ -176,11 +251,11 @@ function InventoryPage({ onBack }) {
                           {' '}
                           <button
                             type="button"
-                            className="inventory-secondary"
+                            className="inventory-secondary, red-button"
                             onClick={() => {
-                              alert(
-                                `Delete functionality for ${item.item_name} will be connected next.`
-                              )
+                              setDeletingItem(item)
+                              setActionMessage('')
+                              setActionError('')
                             }}
                           >
                             Delete
@@ -206,6 +281,23 @@ function InventoryPage({ onBack }) {
           </div>
         </>
       )}
+      {editingItem && (
+        <EditItemForm
+          item={editingItem}
+          onSave={handleSaveEdit}
+          onCancel={() => setEditingItem(null)}
+          saving={savingEdit}
+        />
+      )}
+
+      {deletingItem && (
+        <DeleteItemDialog
+          item={deletingItem}
+          onConfirm={handleConfirmDelete}
+          onCancel={() => setDeletingItem(null)}
+          deleting={savingDelete}
+        />
+      )}      
     </main>
   )
 }

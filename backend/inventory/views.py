@@ -1875,3 +1875,57 @@ def supplier_management(request):
         },
         status=status.HTTP_201_CREATED,
     )
+
+
+@api_view(["DELETE"])
+@permission_classes([IsAuthenticated])
+def delete_inventory_item(request, item_id):
+    staff = get_management_staff(request)
+
+    if staff is None or staff.positionid_id not in [5, 7]:
+        return Response(
+            {"error": "Only the Principal or Store Manager can delete inventory items."},
+            status=status.HTTP_403_FORBIDDEN,
+        )
+
+    try:
+        item = Item.objects.get(itemid=item_id)
+    except Item.DoesNotExist:
+        return Response(
+            {"error": "Inventory item not found."},
+            status=status.HTTP_404_NOT_FOUND,
+        )
+
+    # Protect historical request records.
+    if RequestItem.objects.filter(itemid_id=item_id).exists():
+        return Response(
+            {"error": "This item cannot be deleted because it has request history."},
+            status=status.HTTP_409_CONFLICT,
+        )
+
+    # Protect procurement records.
+    if PurchaseItem.objects.filter(itemid_id=item_id).exists():
+        return Response(
+            {"error": "This item cannot be deleted because it has procurement history."},
+            status=status.HTTP_409_CONFLICT,
+        )
+
+    # Protect inventory audit records.
+    if InventoryAudit.objects.filter(item_id=item_id).exists():
+        return Response(
+            {"error": "This item cannot be deleted because it has audit history."},
+            status=status.HTTP_409_CONFLICT,
+        )
+
+    if item.quantity != 0:
+        return Response(
+            {"error": "Only items with zero stock can be deleted."},
+            status=status.HTTP_409_CONFLICT,
+        )
+
+    item.delete()
+
+    return Response(
+        {"message": "Inventory item deleted successfully."},
+        status=status.HTTP_200_OK,
+    )

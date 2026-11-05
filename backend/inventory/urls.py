@@ -68,4 +68,8 @@ urlpatterns = [
     path("management/staff/", views.staff_management, name="staff_management"),
     path("management/items/", views.item_management, name="item_management"),
     path("management/suppliers/", views.supplier_management, name="supplier_management"),
+    path(
+    "inventory/<int:item_id>/delete/",
+    views.delete_inventory_item,
+    name="delete_inventory_item",),
 ]
