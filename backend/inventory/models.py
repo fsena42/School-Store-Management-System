@@ -243,3 +243,133 @@ class InventoryAudit(models.Model):
     class Meta:
         db_table = "inventory_audit"
         ordering = ["-changed_at"]
+
+
+class RequestDecision(models.Model):
+    request_id = models.IntegerField(unique=True)
+    decision = models.CharField(max_length=10)
+    reason = models.TextField()
+    decided_by_staff_id = models.IntegerField()
+    decided_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        db_table = "request_decision"
+
+
+class RequestApprovalItem(models.Model):
+    request_item_id = models.IntegerField(unique=True)
+    quantity_approved = models.PositiveIntegerField()
+
+    class Meta:
+        db_table = "request_approval_item"
+
+
+class RequestIssue(models.Model):
+    request_item_id = models.IntegerField()
+    item_id = models.IntegerField()
+    quantity = models.PositiveIntegerField()
+    issued_by_staff_id = models.IntegerField()
+    comments = models.TextField(blank=True)
+    issued_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        db_table = "request_issue"
+        indexes = [
+            models.Index(fields=["request_item_id", "issued_at"]),
+        ]
+
+
+class RequestLegacyReview(models.Model):
+    request_item_id = models.IntegerField(unique=True)
+    quantity_previously_issued = models.PositiveIntegerField()
+    reviewed_by_staff_id = models.IntegerField()
+    reason = models.TextField()
+    reviewed_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        db_table = "request_legacy_review"
+
+
+class ItemArchive(models.Model):
+    item_id = models.IntegerField()
+    action = models.CharField(max_length=10)
+    archived_by_staff_id = models.IntegerField()
+    reason = models.TextField()
+    archived_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        db_table = "item_archive"
+        indexes = [
+            models.Index(fields=["item_id", "archived_at"]),
+        ]
+
+
+class StaffContact(models.Model):
+    staff_id = models.IntegerField(unique=True)
+    email = models.EmailField(unique=True)
+
+    class Meta:
+        db_table = "staff_contact"
+
+
+class PurchaseOrder(models.Model):
+    STATUS_DRAFT = "Draft"
+    STATUS_PENDING = "Pending"
+    STATUS_APPROVED = "Approved"
+    STATUS_PARTIALLY_RECEIVED = "Partially Received"
+    STATUS_RECEIVED = "Received"
+    STATUS_REJECTED = "Rejected"
+    STATUS_CHOICES = [
+        (STATUS_DRAFT, STATUS_DRAFT),
+        (STATUS_PENDING, STATUS_PENDING),
+        (STATUS_APPROVED, STATUS_APPROVED),
+        (STATUS_PARTIALLY_RECEIVED, STATUS_PARTIALLY_RECEIVED),
+        (STATUS_RECEIVED, STATUS_RECEIVED),
+        (STATUS_REJECTED, STATUS_REJECTED),
+    ]
+
+    order_number = models.CharField(max_length=30, unique=True)
+    store_id = models.IntegerField()
+    supplier_id = models.IntegerField()
+    created_by_staff_id = models.IntegerField()
+    approved_by_staff_id = models.IntegerField(null=True, blank=True)
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES)
+    order_date = models.DateField()
+    expected_date = models.DateField(null=True, blank=True)
+    notes = models.TextField(blank=True)
+    rejection_reason = models.TextField(blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        db_table = "purchase_order"
+        ordering = ["-created_at"]
+
+
+class PurchaseOrderLine(models.Model):
+    purchase_order = models.ForeignKey(
+        PurchaseOrder, on_delete=models.CASCADE, related_name="lines"
+    )
+    item_id = models.IntegerField()
+    quantity_ordered = models.PositiveIntegerField()
+    quantity_received = models.PositiveIntegerField(default=0)
+    unit_cost = models.DecimalField(max_digits=12, decimal_places=2)
+
+    class Meta:
+        db_table = "purchase_order_line"
+        constraints = [
+            models.UniqueConstraint(
+                fields=["purchase_order", "item_id"],
+                name="unique_purchase_order_item",
+            ),
+        ]
+
+
+class PurchaseOrderReceipt(models.Model):
+    purchase_order = models.ForeignKey(
+        PurchaseOrder, on_delete=models.PROTECT, related_name="receipts"
+    )
+    purchase_id = models.IntegerField(unique=True)
+    received_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        db_table = "purchase_order_receipt"

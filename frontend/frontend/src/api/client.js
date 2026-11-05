@@ -33,11 +33,22 @@ export async function apiRequest(path, options = {}) {
     headers,
   })
 
-  const data = await response.json().catch(() => ({}))
+  const contentType = response.headers.get('content-type') || ''
+  let data = {}
+
+  if (contentType.includes('application/json')) {
+    try {
+      data = await response.json()
+    } catch {
+      data = {}
+    }
+  }
 
   if (!response.ok) {
     throw new Error(
-      data.error || data.detail || 'The request failed.'
+      data.error ||
+      data.detail ||
+      `The server returned an error (${response.status}). Check the Django terminal for details.`
     )
   }
 

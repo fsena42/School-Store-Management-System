@@ -38,7 +38,30 @@ function RequestsPage({ onBack, stores = [] }) {
 
 
   useEffect(() => {
-    loadData()
+    let active = true
+
+    async function loadInitialData() {
+      try {
+        const [itemsData, requestsData] = await Promise.all([
+          apiRequest('/requestable-items/'),
+          apiRequest('/my-requests/'),
+        ])
+        if (!active) return
+        setItems(itemsData.items || [])
+        setRequests(requestsData.requests || [])
+      } catch (err) {
+        if (active) {
+          setError(err.message || 'Could not load request information.')
+        }
+      } finally {
+        if (active) setLoading(false)
+      }
+    }
+
+    loadInitialData()
+    return () => {
+      active = false
+    }
   }, [])
 
   const availableItems = items.filter(
@@ -397,12 +420,33 @@ function RequestsPage({ onBack, stores = [] }) {
                       <td>{request.store_name}</td>
                       <td>
                         {request.items.map((item) => (
-                          <div key={item.item_id}>
-                            {item.item_name} × {item.quantity_requested}
-                          </div>
-                        ))}
-                      </td>
-                      <td>{request.status}</td>
+                              <div key={item.request_item_id || item.item_id}>
+                                <strong>{item.item_name}</strong> · Requested{' '}
+                                {item.quantity_requested}
+                                {item.quantity_approved > 0 && (
+                                  <>
+                                    {' '}· Approved {item.quantity_approved}
+                                    {' '}· Issued {item.quantity_issued}
+                                    {' '}· Remaining {item.quantity_remaining}
+                                  </>
+                                )}
+                                {item.legacy_review_required && (
+                                  <small>
+                                    {' '}· Older approval requires stock/issue review
+                                  </small>
+                                )}
+                              </div>
+                            ))}
+                          </td>
+                          <td>
+                            {request.status}
+                            {request.legacy_review_required && (
+                              <small> · Legacy issue verification needed</small>
+                            )}
+                            {request.decision_reason && (
+                              <small>Reason: {request.decision_reason}</small>
+                            )}
+                          </td>
                       <td>
                         {isDraft ? (
                           <div className="requests-row-actions">

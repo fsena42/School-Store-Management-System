@@ -113,6 +113,38 @@ function InventoryPage({ onBack }) {
       setSavingDelete(false)
     }
   }
+
+  async function handleArchive(item) {
+    const restoring = item.is_archived
+    const reason = window.prompt(
+      `${restoring ? 'Why are you restoring' : 'Why are you archiving'} ${item.item_name}?`
+    )
+    if (!reason?.trim()) return
+
+    setActionError('')
+    setActionMessage('')
+    try {
+      const result = await apiRequest(
+        `/management/items/${item.item_id}/archive/`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            action: restoring ? 'RESTORED' : 'ARCHIVED',
+            reason,
+          }),
+        }
+      )
+      setItems((current) => current.map((entry) =>
+        entry.item_id === item.item_id
+          ? { ...entry, is_archived: result.is_archived }
+          : entry
+      ))
+      setActionMessage(result.message)
+    } catch (err) {
+      setActionError(err.message || 'Could not change archive state.')
+    }
+  }
   const stores = [...new Map(
     items.map((item) => [
       item.store_id,
@@ -215,6 +247,7 @@ function InventoryPage({ onBack }) {
                 <tr>
                   <th>Item ID</th>
                   <th>Item name</th>
+                  <th>Lifecycle</th>
                   <th>Store</th>
                   <th>Quantity</th>
                   <th>Reorder level</th>
@@ -231,6 +264,11 @@ function InventoryPage({ onBack }) {
                     <tr key={item.item_id}>
                       <td>{item.item_id}</td>
                       <td>{item.item_name}</td>
+                      <td>
+                        <span className={item.is_archived ? 'stock-status low' : 'stock-status normal'}>
+                          {item.is_archived ? 'Archived' : 'Active'}
+                        </span>
+                      </td>
                       <td>{item.store_name}</td>
                       <td>{item.quantity}</td>
                       <td>{item.reorder_level}</td>
@@ -247,6 +285,15 @@ function InventoryPage({ onBack }) {
                           <button
                             type="button"
                             className="inventory-secondary"
+                            onClick={() => handleArchive(item)}
+                          >
+                            {item.is_archived ? 'Restore' : 'Archive'}
+                          </button>
+                          {' '}
+                          <button
+                            type="button"
+                            className="inventory-secondary"
+                            disabled={item.is_archived}
                             onClick={() => {
                               setEditingItem(item)
                               setActionMessage('')
@@ -259,8 +306,8 @@ function InventoryPage({ onBack }) {
                           <button
                             type="button"
                             className="inventory-secondary inventory-delete"
-                            disabled={Boolean(item.delete_block_reason)}
-                            title={item.delete_block_reason || 'Delete item'}
+                            disabled={Boolean(item.delete_block_reason) || item.is_archived}
+                            title={item.delete_block_reason || (item.is_archived ? 'Archived items cannot be deleted.' : 'Delete item')}
                             aria-label={`Delete ${item.item_name}`}
                             onClick={() => {
                               setDeletingItem(item)
@@ -287,7 +334,7 @@ function InventoryPage({ onBack }) {
                 {filteredItems.length === 0 && (
                   <tr>
                     <td
-                      colSpan={canManageInventory ? 7 : 6}
+                      colSpan={canManageInventory ? 8 : 7}
                       className="inventory-empty"
                     >
                       No matching inventory items found.
@@ -301,6 +348,7 @@ function InventoryPage({ onBack }) {
       )}
       {editingItem && (
         <EditItemForm
+          key={editingItem.item_id}
           item={editingItem}
           onSave={handleSaveEdit}
           onCancel={() => setEditingItem(null)}

@@ -1,20 +1,13 @@
 
-import { useEffect, useState } from 'react'
+import { useState } from 'react'
 
 function EditItemForm({ item, onSave, onCancel, saving }) {
-  const [itemName, setItemName] = useState('')
-  const [quantity, setQuantity] = useState('')
-  const [reorderLevel, setReorderLevel] = useState('')
+  const [itemName, setItemName] = useState(item?.item_name || '')
+  const [quantity, setQuantity] = useState(String(item?.quantity ?? ''))
+  const [reorderLevel, setReorderLevel] = useState(
+    String(item?.reorder_level ?? '')
+  )
   const [comments, setComments] = useState('')
-
-  useEffect(() => {
-    if (item) {
-      setItemName(item.item_name || '')
-      setQuantity(String(item.quantity ?? ''))
-      setReorderLevel(String(item.reorder_level ?? ''))
-      setComments('')
-    }
-  }, [item])
 
   function handleSubmit(event) {
     event.preventDefault()

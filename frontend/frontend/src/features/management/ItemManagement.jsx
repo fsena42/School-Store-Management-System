@@ -30,8 +30,27 @@ export default function ItemManagement() {
   }, [])
 
   useEffect(() => {
-    loadItems()
-  }, [loadItems])
+    let active = true
+
+    async function loadInitialItems() {
+      try {
+        const result = await apiRequest('/management/items/')
+        if (active) {
+          setData(result)
+          setError('')
+        }
+      } catch (err) {
+        if (active) setError(err.message)
+      } finally {
+        if (active) setLoading(false)
+      }
+    }
+
+    loadInitialItems()
+    return () => {
+      active = false
+    }
+  }, [])
 
   function update(field, value) {
     setForm((previous) => ({ ...previous, [field]: value }))

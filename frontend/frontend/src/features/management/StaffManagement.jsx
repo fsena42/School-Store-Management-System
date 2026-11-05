@@ -6,6 +6,7 @@ const emptyForm = {
   surname: '',
   othernames: '',
   contact: '',
+  email: '',
   department_id: '',
   position_id: '',
 }
@@ -35,8 +36,27 @@ export default function StaffManagement() {
   }, [])
 
   useEffect(() => {
-    loadStaff()
-  }, [loadStaff])
+    let active = true
+
+    async function loadInitialStaff() {
+      try {
+        const result = await apiRequest('/management/staff/')
+        if (active) {
+          setData(result)
+          setError('')
+        }
+      } catch (err) {
+        if (active) setError(err.message)
+      } finally {
+        if (active) setLoading(false)
+      }
+    }
+
+    loadInitialStaff()
+    return () => {
+      active = false
+    }
+  }, [])
 
   function update(field, value) {
     setForm((previous) => ({ ...previous, [field]: value }))
@@ -60,7 +80,7 @@ export default function StaffManagement() {
       })
 
       setMessage(
-        `${result.message} Staff ID: ${result.staff_id}. A login account has not been created.`
+        `${result.message} Staff ID: ${result.staff_id}.`
       )
       setForm(emptyForm)
       await loadStaff()
@@ -68,6 +88,20 @@ export default function StaffManagement() {
       setError(err.message)
     } finally {
       setSaving(false)
+    }
+  }
+
+  async function resendInvite(staffId) {
+    setError('')
+    setMessage('')
+    try {
+      const result = await apiRequest(`/management/staff/${staffId}/invite/`, {
+        method: 'POST',
+      })
+      setMessage(result.message)
+      await loadStaff()
+    } catch (err) {
+      setError(err.message)
     }
   }
 
@@ -103,6 +137,18 @@ export default function StaffManagement() {
             maxLength={20}
             value={form.contact}
             onChange={(e) => update('contact', e.target.value)}
+          />
+        </label>
+
+        <label>
+          Email for account setup
+          <input
+            type="email"
+            autoComplete="email"
+            required
+            maxLength={254}
+            value={form.email}
+            onChange={(e) => update('email', e.target.value)}
           />
         </label>
 
@@ -166,6 +212,8 @@ export default function StaffManagement() {
                 <th>Department</th>
                 <th>Position</th>
                 <th>Contact</th>
+                <th>Email / login</th>
+                <th>Account action</th>
               </tr>
             </thead>
             <tbody>
@@ -176,11 +224,27 @@ export default function StaffManagement() {
                   <td>{person.department}</td>
                   <td>{person.position}</td>
                   <td>{person.contact}</td>
+                  <td>
+                    {person.email || '—'}
+                    {person.email && (
+                      <small> · {person.login_ready ? 'Ready' : 'Setup pending'}</small>
+                    )}
+                  </td>
+                  <td>
+                    {person.email && !person.login_ready && (
+                      <button
+                        type="button"
+                        onClick={() => resendInvite(person.staff_id)}
+                      >
+                        Resend setup link
+                      </button>
+                    )}
+                  </td>
                 </tr>
               ))}
               {data.staff.length === 0 && (
                 <tr>
-                  <td colSpan="5">No staff records found.</td>
+                  <td colSpan="7">No staff records found.</td>
                 </tr>
               )}
             </tbody>
