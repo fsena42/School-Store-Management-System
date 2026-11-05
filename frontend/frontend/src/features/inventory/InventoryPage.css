@@ -1,7 +1,10 @@
 
 .inventory-page {
   min-height: 100vh;
-  padding: 32px;
+  width: 100%;
+  max-width: 1440px;
+  margin: 0 auto;
+  padding: 36px;
   background: #f3f6fb;
   color: #172033;
   font-family: Inter, "Segoe UI", Arial, sans-serif;
@@ -159,7 +162,7 @@
 
 @media (max-width: 600px) {
   .inventory-page {
-    padding: 20px 14px;
+    padding: 20px 16px;
   }
 
   .inventory-header,
