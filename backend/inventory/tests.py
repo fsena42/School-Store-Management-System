@@ -127,6 +127,34 @@ class StoreWorkflowTests(TestCase):
         client.force_authenticate(user=user)
         return staff, client
 
+    def test_workflow_tables_are_consolidated_into_existing_tables(self):
+        table_names = {
+            table.name.lower()
+            for table in connection.introspection.get_table_list(
+                connection.cursor()
+            )
+        }
+        self.assertTrue({
+            "item",
+            "purchase",
+            "purchase_item",
+            "request",
+            "request_item",
+            "staff",
+            "inventory_audit",
+        }.issubset(table_names))
+        self.assertTrue({
+            "item_archive",
+            "purchase_order",
+            "purchase_order_line",
+            "purchase_order_receipt",
+            "request_approval_item",
+            "request_decision",
+            "request_issue",
+            "request_legacy_review",
+            "staff_contact",
+        }.isdisjoint(table_names))
+
     def make_request(self, quantity=10, status_name="Pending", old_issued=0):
         req = Request.objects.create(
             storeid=self.store,

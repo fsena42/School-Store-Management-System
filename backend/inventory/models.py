@@ -41,6 +41,10 @@ class Item(models.Model):
     quantity = models.IntegerField(db_column='Quantity', db_comment='Current quantity of item in stock ')  # Field name made lowercase.
     reorderlevel = models.IntegerField(db_column='ReorderLevel', db_comment='Minimum stock level before reordering ')  # Field name made lowercase.
     storeid = models.ForeignKey('Store', models.DO_NOTHING, db_column='StoreID', db_comment='Identifies the store where the item belongs ')  # Field name made lowercase.
+    is_archived = models.BooleanField(db_column='IsArchived', default=False)
+    archived_by_staff_id = models.IntegerField(db_column='ArchivedBy', blank=True, null=True)
+    archived_at = models.DateTimeField(db_column='ArchivedAt', blank=True, null=True)
+    archive_reason = models.TextField(db_column='ArchiveReason', blank=True, null=True)
 
     class Meta:
         managed = False
@@ -57,14 +61,43 @@ class Position(models.Model):
 
 
 class Purchase(models.Model):
+    TYPE_RECEIPT = 'RECEIPT'
+    TYPE_ORDER = 'ORDER'
+    STATUS_PENDING = 'Pending'
+    STATUS_APPROVED = 'Approved'
+    STATUS_PARTIALLY_RECEIVED = 'Partially Received'
+    STATUS_RECEIVED = 'Received'
+    STATUS_REJECTED = 'Rejected'
+
     purchaseid = models.AutoField(db_column='PurchaseID', primary_key=True, db_comment='Unique identifier for each purchase made ')  # Field name made lowercase.
     storeid = models.ForeignKey('Store', models.DO_NOTHING, db_column='StoreID', db_comment='Store for which the purchase is made; references STORE ')  # Field name made lowercase.
     supplierid = models.ForeignKey('Supplier', models.DO_NOTHING, db_column='SupplierID', db_comment='Supplier who provided the purchase ')  # Field name made lowercase.
     staffid = models.ForeignKey('Staff', models.DO_NOTHING, db_column='StaffID', db_comment='Staff member responsible for the purchase ')  # Field name made lowercase.
     invoicenumber = models.CharField(db_column='InvoiceNumber', unique=True, max_length=20, db_comment='Unique number on the supplier�s invoice ')  # Field name made lowercase.
+    order_number = models.CharField(
+        db_column='OrderNumber',
+        max_length=30,
+        blank=True,
+        null=True,
+        unique=True,
+    )
     invoicedate = models.DateField(db_column='InvoiceDate', db_comment='Date on supplier invoice ')  # Field name made lowercase.
     purchasedate = models.DateField(db_column='PurchaseDate', db_comment='Date on which the purchase was made ')  # Field name made lowercase.
     totalamount = models.DecimalField(db_column='TotalAmount', max_digits=12, decimal_places=3, db_comment='Total monetary value of the purchase ')  # Field name made lowercase.
+    transaction_type = models.CharField(db_column='TransactionType', max_length=12, default='RECEIPT')
+    parent_purchase = models.ForeignKey(
+        'self',
+        models.DO_NOTHING,
+        db_column='ParentPurchaseID',
+        blank=True,
+        null=True,
+        related_name='receipts',
+    )
+    order_status = models.CharField(db_column='OrderStatus', max_length=20, blank=True, default='')
+    approved_by_staff_id = models.IntegerField(db_column='ApprovedBy', blank=True, null=True)
+    expected_date = models.DateField(db_column='ExpectedDate', blank=True, null=True)
+    notes = models.TextField(db_column='Notes', blank=True, default='')
+    rejection_reason = models.TextField(db_column='RejectionReason', blank=True, default='')
 
     class Meta:
         managed = False
@@ -121,6 +154,11 @@ class Request(models.Model):
     requestdate = models.DateField(db_column='RequestDate', db_comment='Date on which request was made ')  # Field name made lowercase.
     statusid = models.ForeignKey('Status', models.DO_NOTHING, db_column='StatusID', db_comment='Current status of request; references STATUS ')  # Field name made lowercase.
     approvedby = models.ForeignKey('Staff', models.DO_NOTHING, db_column='ApprovedBy', related_name='request_approvedby_set', blank=True, null=True)  # Field name made lowercase.
+    decision_reason = models.TextField(db_column='DecisionReason', blank=True, default='')
+    decided_at = models.DateTimeField(db_column='DecidedAt', blank=True, null=True)
+    legacy_review_reason = models.TextField(db_column='LegacyReviewReason', blank=True, default='')
+    legacy_reviewed_by_id = models.IntegerField(db_column='LegacyReviewedBy', blank=True, null=True)
+    legacy_reviewed_at = models.DateTimeField(db_column='LegacyReviewedAt', blank=True, null=True)
 
     class Meta:
         managed = False
@@ -137,6 +175,7 @@ class RequestItem(models.Model):
     itemid = models.ForeignKey(Item, models.DO_NOTHING, db_column='ItemID', db_comment='Item being requested ')  # Field name made lowercase.
     qtyrequested = models.IntegerField(db_column='QtyRequested', db_comment='Quantity requested by the staff member ')  # Field name made lowercase.
     qtyissued = models.IntegerField(db_column='QtyIssued', db_comment='Quantity actually issued ')  # Field name made lowercase.
+    quantity_approved = models.IntegerField(db_column='QtyApproved', blank=True, null=True)
 
     class Meta:
         managed = False
@@ -150,6 +189,7 @@ class Staff(models.Model):
     departmentid = models.ForeignKey(Department, models.DO_NOTHING, db_column='DepartmentID', db_comment='Department where staff member belongs; references DEPARTMENT ')  # Field name made lowercase.
     positionid = models.ForeignKey(Position, models.DO_NOTHING, db_column='PositionID', db_comment='Staff member�s position; references position')  # Field name made lowercase.
     contact = models.CharField(db_column='Contact', max_length=20, db_comment=' Staff member�s contact ')  # Field name made lowercase.
+    email = models.EmailField(db_column='Email', max_length=254, blank=True, null=True, unique=True)
 
     class Meta:
         managed = False
@@ -231,145 +271,20 @@ class InventoryAudit(models.Model):
     old_value = models.TextField(blank=True)
     new_value = models.TextField(blank=True)
     comments = models.TextField()
+    request_item_id = models.IntegerField(blank=True, null=True)
+    quantity_delta = models.PositiveIntegerField(default=0)
 
     changed_by = models.ForeignKey(
         settings.AUTH_USER_MODEL,
         on_delete=models.PROTECT,
         related_name="inventory_audit_entries",
+        blank=True,
+        null=True,
     )
+    changed_by_staff_id = models.IntegerField(blank=True, null=True)
 
     changed_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:
         db_table = "inventory_audit"
         ordering = ["-changed_at"]
-
-
-class RequestDecision(models.Model):
-    request_id = models.IntegerField(unique=True)
-    decision = models.CharField(max_length=10)
-    reason = models.TextField()
-    decided_by_staff_id = models.IntegerField()
-    decided_at = models.DateTimeField(auto_now_add=True)
-
-    class Meta:
-        db_table = "request_decision"
-
-
-class RequestApprovalItem(models.Model):
-    request_item_id = models.IntegerField(unique=True)
-    quantity_approved = models.PositiveIntegerField()
-
-    class Meta:
-        db_table = "request_approval_item"
-
-
-class RequestIssue(models.Model):
-    request_item_id = models.IntegerField()
-    item_id = models.IntegerField()
-    quantity = models.PositiveIntegerField()
-    issued_by_staff_id = models.IntegerField()
-    comments = models.TextField(blank=True)
-    issued_at = models.DateTimeField(auto_now_add=True)
-
-    class Meta:
-        db_table = "request_issue"
-        indexes = [
-            models.Index(fields=["request_item_id", "issued_at"]),
-        ]
-
-
-class RequestLegacyReview(models.Model):
-    request_item_id = models.IntegerField(unique=True)
-    quantity_previously_issued = models.PositiveIntegerField()
-    reviewed_by_staff_id = models.IntegerField()
-    reason = models.TextField()
-    reviewed_at = models.DateTimeField(auto_now_add=True)
-
-    class Meta:
-        db_table = "request_legacy_review"
-
-
-class ItemArchive(models.Model):
-    item_id = models.IntegerField()
-    action = models.CharField(max_length=10)
-    archived_by_staff_id = models.IntegerField()
-    reason = models.TextField()
-    archived_at = models.DateTimeField(auto_now_add=True)
-
-    class Meta:
-        db_table = "item_archive"
-        indexes = [
-            models.Index(fields=["item_id", "archived_at"]),
-        ]
-
-
-class StaffContact(models.Model):
-    staff_id = models.IntegerField(unique=True)
-    email = models.EmailField(unique=True)
-
-    class Meta:
-        db_table = "staff_contact"
-
-
-class PurchaseOrder(models.Model):
-    STATUS_DRAFT = "Draft"
-    STATUS_PENDING = "Pending"
-    STATUS_APPROVED = "Approved"
-    STATUS_PARTIALLY_RECEIVED = "Partially Received"
-    STATUS_RECEIVED = "Received"
-    STATUS_REJECTED = "Rejected"
-    STATUS_CHOICES = [
-        (STATUS_DRAFT, STATUS_DRAFT),
-        (STATUS_PENDING, STATUS_PENDING),
-        (STATUS_APPROVED, STATUS_APPROVED),
-        (STATUS_PARTIALLY_RECEIVED, STATUS_PARTIALLY_RECEIVED),
-        (STATUS_RECEIVED, STATUS_RECEIVED),
-        (STATUS_REJECTED, STATUS_REJECTED),
-    ]
-
-    order_number = models.CharField(max_length=30, unique=True)
-    store_id = models.IntegerField()
-    supplier_id = models.IntegerField()
-    created_by_staff_id = models.IntegerField()
-    approved_by_staff_id = models.IntegerField(null=True, blank=True)
-    status = models.CharField(max_length=20, choices=STATUS_CHOICES)
-    order_date = models.DateField()
-    expected_date = models.DateField(null=True, blank=True)
-    notes = models.TextField(blank=True)
-    rejection_reason = models.TextField(blank=True)
-    created_at = models.DateTimeField(auto_now_add=True)
-
-    class Meta:
-        db_table = "purchase_order"
-        ordering = ["-created_at"]
-
-
-class PurchaseOrderLine(models.Model):
-    purchase_order = models.ForeignKey(
-        PurchaseOrder, on_delete=models.CASCADE, related_name="lines"
-    )
-    item_id = models.IntegerField()
-    quantity_ordered = models.PositiveIntegerField()
-    quantity_received = models.PositiveIntegerField(default=0)
-    unit_cost = models.DecimalField(max_digits=12, decimal_places=2)
-
-    class Meta:
-        db_table = "purchase_order_line"
-        constraints = [
-            models.UniqueConstraint(
-                fields=["purchase_order", "item_id"],
-                name="unique_purchase_order_item",
-            ),
-        ]
-
-
-class PurchaseOrderReceipt(models.Model):
-    purchase_order = models.ForeignKey(
-        PurchaseOrder, on_delete=models.PROTECT, related_name="receipts"
-    )
-    purchase_id = models.IntegerField(unique=True)
-    received_at = models.DateTimeField(auto_now_add=True)
-
-    class Meta:
-        db_table = "purchase_order_receipt"

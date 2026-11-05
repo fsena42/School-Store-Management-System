@@ -106,7 +106,7 @@ After importing the database, apply the Django migrations from `backend/`:
 python manage.py migrate
 ```
 
-The workflow migration adds tables for approval and issue history, purchase orders and receipts, item archiving, and staff account setup. It does not rewrite existing request or stock records. Legacy approved requests are flagged for Store Manager review; reviewing them does not change stock.
+The workflow migrations add workflow fields to the existing `item`, `purchase`, `request`, `request_item`, `staff`, and `inventory_audit` tables. Migration `0005` transfers any workflow data from the earlier auxiliary tables into those existing tables and removes the auxiliary tables. Back up the database before applying migrations. Applying these changes to an existing database still requires the schema update; importing an unchanged backup alone is not sufficient. Legacy approved requests remain flagged for Store Manager review, and reviewing them does not adjust stock.
 
 Staff account invitations require SMTP configuration in `backend/.env`. Set `EMAIL_HOST`, `EMAIL_PORT`, `EMAIL_USE_TLS`, `EMAIL_HOST_USER`, `EMAIL_HOST_PASSWORD`, and `DEFAULT_FROM_EMAIL` to values from your mail provider. Configure `FRONTEND_URL` to the URL users will use to complete account setup. The development server's email settings must not be used as production credentials.
 

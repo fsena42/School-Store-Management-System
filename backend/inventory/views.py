@@ -12,6 +12,7 @@ from django.core.mail import send_mail
 from django.core.exceptions import ValidationError
 from django.core.validators import validate_email
 from django.utils.encoding import force_bytes
+from django.utils import timezone
 from django.utils.http import urlsafe_base64_encode, urlsafe_base64_decode
 
 from django.middleware.csrf import get_token
@@ -24,9 +25,7 @@ from rest_framework.response import Response
 
 from .models import (
     Request, RequestItem, Status, StaffAccount, Staff, Department, Position,
-    Store, Item, Unit, InventoryAudit, RequestDecision, RequestApprovalItem,
-    RequestIssue, ItemArchive, StaffContact, PurchaseOrder, PurchaseOrderLine,
-    PurchaseOrderReceipt, RequestLegacyReview,
+    Store, Item, Unit, InventoryAudit,
 )
 from .serializers import RequestSerializer
 from .permissions import (
@@ -42,6 +41,7 @@ from .permissions import (
 
 from decimal import Decimal, InvalidOperation
 import smtplib
+import uuid
 from django.db import IntegrityError
 from django.db.models import Max
 
@@ -213,14 +213,9 @@ def send_account_setup_email(user, email):
 
 
 def archived_item_ids():
-    latest_action_by_item = {}
-    for event in ItemArchive.objects.order_by("-archived_at", "-pk"):
-        latest_action_by_item.setdefault(event.item_id, event.action)
-    return {
-        item_id
-        for item_id, action in latest_action_by_item.items()
-        if action == "ARCHIVED"
-    }
+    return set(
+        Item.objects.filter(is_archived=True).values_list("itemid", flat=True)
+    )
 
 
 @api_view(["POST"])
@@ -356,9 +351,9 @@ def inventory_list(request):
             delete_block_reason = (
                 "This item cannot be deleted because it has audit history."
             )
-        elif ItemArchive.objects.filter(item_id=item.itemid).exists():
+        elif item.is_archived:
             delete_block_reason = (
-                "This item cannot be deleted because it has archive history."
+                "Restore this item before deleting it."
             )
         elif item.quantity != 0:
             delete_block_reason = "Only items with zero stock can be deleted."
@@ -539,14 +534,7 @@ def my_requests(request):
             .select_related("itemid")
         )
 
-        decision = RequestDecision.objects.filter(
-            request_id=req.requestid
-        ).first()
-        legacy_decision = (
-            decision is None
-            and req.statusid.statusname.lower()
-            in {"approved", "partially issued", "issued"}
-        )
+        legacy_decision = legacy_approval_requires_review(req)
 
         results.append({
             "request_id": req.requestid,
@@ -555,7 +543,7 @@ def my_requests(request):
             "request_date": req.requestdate,
             "status_id": req.statusid_id,
             "status": req.statusid.statusname,
-            "decision_reason": decision.reason if decision else "",
+            "decision_reason": req.decision_reason,
             "legacy_review_required": legacy_decision,
             "items": [
                 request_item_summary(line, legacy_decision)
@@ -566,24 +554,22 @@ def my_requests(request):
     return Response({"requests": results})
 
 
-def request_item_summary(line, legacy_review_required=False):
-    approval = RequestApprovalItem.objects.filter(
-        request_item_id=line.requestitemid
-    ).first()
-    issued = RequestIssue.objects.filter(
-        request_item_id=line.requestitemid
-    ).aggregate(total=Sum("quantity"))["total"] or 0
-    legacy_review = RequestLegacyReview.objects.filter(
-        request_item_id=line.requestitemid
-    ).first()
-    if legacy_review:
-        issued += legacy_review.quantity_previously_issued
+def legacy_approval_requires_review(req):
+    return (
+        req.statusid.statusname.lower()
+        in {"approved", "partially issued", "issued"}
+        and req.decided_at is None
+        and req.legacy_reviewed_at is None
+    )
 
+
+def request_item_summary(line, legacy_review_required=False):
+    issued = line.qtyissued
     if legacy_review_required:
-        approved = line.qtyissued
+        approved = None
         remaining = 0
     else:
-        approved = approval.quantity_approved if approval else 0
+        approved = line.quantity_approved or 0
         remaining = max(0, approved - issued)
 
     return {
@@ -595,9 +581,7 @@ def request_item_summary(line, legacy_review_required=False):
         "quantity_issued": issued,
         "quantity_remaining": remaining,
         "legacy_review_required": legacy_review_required,
-        "legacy_quantity_recorded": (
-            line.qtyissued if legacy_review_required else None
-        ),
+        "legacy_quantity_recorded": line.qtyissued if legacy_review_required else None,
     }
 
 
@@ -966,21 +950,14 @@ def request_issue_history(request):
             .select_related("itemid")
             .order_by("requestitemid")
         )
-        decision = RequestDecision.objects.filter(
-            request_id=req.requestid
-        ).first()
-        legacy = (
-            decision is None
-            and req.statusid.statusname.lower()
-            in {"approved", "partially issued", "issued"}
-        )
+        legacy = legacy_approval_requires_review(req)
         results.append({
             "request_id": req.requestid,
             "request_date": req.requestdate,
             "requester": f"{req.staffid.othernames} {req.staffid.surname}".strip(),
             "store_name": req.storeid.storename,
             "status": req.statusid.statusname,
-            "decision_reason": decision.reason if decision else "",
+            "decision_reason": req.decision_reason,
             "legacy_review_required": legacy,
             "items": [
                 request_item_summary(line, legacy)
@@ -1040,7 +1017,7 @@ def approve_request(request, request_id):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        if RequestDecision.objects.filter(request_id=req.requestid).exists():
+        if req.decided_at is not None or req.legacy_reviewed_at is not None:
             return Response(
                 {"error": "This request already has a recorded decision."},
                 status=status.HTTP_409_CONFLICT,
@@ -1129,21 +1106,15 @@ def approve_request(request, request_id):
                 )
 
         for line in lines:
-            RequestApprovalItem.objects.create(
-                request_item_id=line.requestitemid,
-                quantity_approved=submitted[line.requestitemid],
-            )
-
-        RequestDecision.objects.create(
-            request_id=req.requestid,
-            decision="APPROVED",
-            reason=reason.strip(),
-            decided_by_staff_id=staff.staffid,
-        )
-
+            line.quantity_approved = submitted[line.requestitemid]
+            line.save(update_fields=["quantity_approved"])
         req.statusid = new_status
         req.approvedby = staff
-        req.save(update_fields=["statusid", "approvedby"])
+        req.decision_reason = reason.strip()
+        req.decided_at = timezone.now()
+        req.save(update_fields=[
+            "statusid", "approvedby", "decision_reason", "decided_at"
+        ])
 
     return Response({
         "message": "Request quantities approved. The Store Manager must issue stock separately.",
@@ -1181,16 +1152,13 @@ def pending_issues(request):
     legacy_review = []
 
     for req in pending:
-        decision = RequestDecision.objects.filter(
-            request_id=req.requestid
-        ).first()
         lines = list(
             RequestItem.objects.filter(requestid=req)
             .select_related("itemid")
             .order_by("requestitemid")
         )
 
-        if decision is None:
+        if legacy_approval_requires_review(req):
             legacy_review.append({
                 "request_id": req.requestid,
                 "requester": f"{req.staffid.othernames} {req.staffid.surname}".strip(),
@@ -1214,15 +1182,9 @@ def pending_issues(request):
 
         item_summaries = []
         for line in lines:
-            approval = RequestApprovalItem.objects.filter(
-                request_item_id=line.requestitemid
-            ).first()
-            if approval is None:
+            if line.quantity_approved is None:
                 continue
-            issued = RequestIssue.objects.filter(
-                request_item_id=line.requestitemid
-            ).aggregate(total=Sum("quantity"))["total"] or 0
-            remaining = max(0, approval.quantity_approved - issued)
+            remaining = max(0, line.quantity_approved - line.qtyissued)
             if remaining:
                 item_summaries.append({
                     **request_item_summary(line),
@@ -1311,7 +1273,7 @@ def reconcile_legacy_request(request, request_id):
             )
         if req.statusid.statusname.lower() not in {
             "approved", "partially issued", "issued"
-        } or RequestDecision.objects.filter(request_id=req.requestid).exists():
+        } or req.decided_at is not None or req.legacy_reviewed_at is not None:
             return Response(
                 {"error": "This request is not an unresolved legacy approval."},
                 status=status.HTTP_409_CONFLICT,
@@ -1356,29 +1318,24 @@ def reconcile_legacy_request(request, request_id):
                 status=status.HTTP_500_INTERNAL_SERVER_ERROR,
             )
 
-        RequestDecision.objects.create(
-            request_id=req.requestid,
-            decision="APPROVED",
-            reason=f"Legacy issue history verified: {reason.strip()}",
-            decided_by_staff_id=staff.staffid,
-        )
         for line in lines:
             approved, previously_issued = submitted[line.requestitemid]
-            RequestApprovalItem.objects.create(
-                request_item_id=line.requestitemid,
-                quantity_approved=approved,
-            )
-            RequestLegacyReview.objects.create(
-                request_item_id=line.requestitemid,
-                quantity_previously_issued=previously_issued,
-                reviewed_by_staff_id=staff.staffid,
-                reason=reason.strip(),
-            )
+            line.quantity_approved = approved
             line.qtyissued = previously_issued
-            line.save(update_fields=["qtyissued"])
+            line.save(update_fields=["quantity_approved", "qtyissued"])
 
         req.statusid = next_status
-        req.save(update_fields=["statusid"])
+        req.legacy_review_reason = reason.strip()
+        req.legacy_reviewed_by_id = staff.staffid
+        req.legacy_reviewed_at = timezone.now()
+        req.decided_at = timezone.now()
+        req.save(update_fields=[
+            "statusid",
+            "legacy_review_reason",
+            "legacy_reviewed_by_id",
+            "legacy_reviewed_at",
+            "decided_at",
+        ])
 
     return Response({
         "message": "Legacy quantities were recorded for review; current stock was not changed.",
@@ -1457,11 +1414,7 @@ def issue_request(request, request_id):
                 status=status.HTTP_404_NOT_FOUND,
             )
 
-        decision = RequestDecision.objects.filter(
-            request_id=req.requestid,
-            decision="APPROVED",
-        ).first()
-        if decision is None:
+        if req.decided_at is None:
             return Response(
                 {"error": "This request has no verified approval. Review legacy requests before issuing."},
                 status=status.HTTP_409_CONFLICT,
@@ -1483,23 +1436,13 @@ def issue_request(request, request_id):
         issue_rows = []
         for line_id, quantity in submitted.items():
             line = line_by_id[line_id]
-            approval = RequestApprovalItem.objects.filter(
-                request_item_id=line_id
-            ).first()
-            if approval is None:
+            if line.quantity_approved is None:
                 return Response(
                     {"error": "An item in this request has no approved quantity."},
                     status=status.HTTP_409_CONFLICT,
                 )
-            issued_before = RequestIssue.objects.filter(
-                request_item_id=line_id
-            ).aggregate(total=Sum("quantity"))["total"] or 0
-            legacy_review = RequestLegacyReview.objects.filter(
-                request_item_id=line_id
-            ).first()
-            if legacy_review:
-                issued_before += legacy_review.quantity_previously_issued
-            remaining = approval.quantity_approved - issued_before
+            issued_before = line.qtyissued
+            remaining = line.quantity_approved - issued_before
             if quantity > remaining:
                 return Response(
                     {"error": f"Issue quantity for {line.itemid.itemname} exceeds its approved remaining quantity ({remaining})."},
@@ -1515,24 +1458,16 @@ def issue_request(request, request_id):
             issue_rows.append((line, item, quantity, issued_before))
 
         for line, item, quantity, issued_before in issue_rows:
-            new_stock = item.quantity - quantity
+            old_stock = item.quantity
+            new_stock = old_stock - quantity
             item.quantity = new_stock
             item.save(update_fields=["quantity"])
-            RequestIssue.objects.create(
-                request_item_id=line.requestitemid,
-                item_id=item.itemid,
-                quantity=quantity,
-                issued_by_staff_id=staff.staffid,
-                comments=comments.strip(),
-            )
-            line.qtyissued = issued_before + quantity
-            line.save(update_fields=["qtyissued"])
             InventoryAudit.objects.create(
                 item_id=item.itemid,
                 item_name=item.itemname,
                 action="ISSUE",
                 field_changed="quantity",
-                old_value=str(new_stock + quantity),
+                old_value=str(old_stock),
                 new_value=str(new_stock),
                 comments=(
                     f"Request {req.requestid}; issued to "
@@ -1540,23 +1475,17 @@ def issue_request(request, request_id):
                     f"{comments.strip()}"
                 ).strip(),
                 changed_by=request.user,
+                changed_by_staff_id=staff.staffid,
+                request_item_id=line.requestitemid,
+                quantity_delta=quantity,
             )
+            line.qtyissued = issued_before + quantity
+            line.save(update_fields=["qtyissued"])
 
-        all_approved = list(
-            RequestApprovalItem.objects.filter(
-                request_item_id__in=line_by_id
-            ).values_list("request_item_id", "quantity_approved")
-        )
-        all_complete = bool(all_approved) and all(
-            (RequestIssue.objects.filter(request_item_id=line_id)
-             .aggregate(total=Sum("quantity"))["total"] or 0)
-            + (
-                RequestLegacyReview.objects.filter(
-                    request_item_id=line_id
-                ).values_list("quantity_previously_issued", flat=True).first()
-                or 0
-            ) >= approved
-            for line_id, approved in all_approved
+        all_complete = bool(lines) and all(
+            line.quantity_approved is not None
+            and line.qtyissued >= line.quantity_approved
+            for line in lines
         )
         next_status_name = "Issued" if all_complete else "Partially Issued"
         next_status = Status.objects.filter(
@@ -1618,7 +1547,7 @@ def reject_request(request, request_id):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        if RequestDecision.objects.filter(request_id=req.requestid).exists():
+        if req.decided_at is not None or req.legacy_reviewed_at is not None:
             return Response(
                 {"error": "This request already has a recorded decision."},
                 status=status.HTTP_409_CONFLICT,
@@ -1636,13 +1565,11 @@ def reject_request(request, request_id):
 
         req.statusid = rejected_status
         req.approvedby = staff
-        req.save(update_fields=["statusid", "approvedby"])
-        RequestDecision.objects.create(
-            request_id=req.requestid,
-            decision="REJECTED",
-            reason=reason.strip(),
-            decided_by_staff_id=staff.staffid,
-        )
+        req.decision_reason = reason.strip()
+        req.decided_at = timezone.now()
+        req.save(update_fields=[
+            "statusid", "approvedby", "decision_reason", "decided_at"
+        ])
 
     return Response({
         "message": "Request rejected successfully.",
@@ -1653,32 +1580,38 @@ def reject_request(request, request_id):
 
 def purchase_order_summary(order):
     supplier = Supplier.objects.filter(
-        supplierid=order.supplier_id
+        supplierid=order.supplierid_id
     ).first()
-    store = Store.objects.filter(storeid=order.store_id).first()
+    store = Store.objects.filter(storeid=order.storeid_id).first()
     lines = []
-    for line in order.lines.order_by("pk"):
-        item = Item.objects.filter(itemid=line.item_id).first()
+    for line in PurchaseItem.objects.filter(
+        purchaseid_id=order.purchaseid
+    ).order_by("purchaseitemid"):
+        received = PurchaseItem.objects.filter(
+            purchaseid__parent_purchase_id=order.purchaseid,
+            itemid_id=line.itemid_id,
+        ).aggregate(total=Sum("quantity"))["total"] or 0
+        item = Item.objects.filter(itemid=line.itemid_id).first()
         lines.append({
-            "line_id": line.pk,
-            "item_id": line.item_id,
+            "line_id": line.purchaseitemid,
+            "item_id": line.itemid_id,
             "item_name": item.itemname if item else "Unknown item",
-            "quantity_ordered": line.quantity_ordered,
-            "quantity_received": line.quantity_received,
+            "quantity_ordered": line.quantity,
+            "quantity_received": received,
             "quantity_remaining": max(
-                0, line.quantity_ordered - line.quantity_received
+                0, line.quantity - received
             ),
-            "unit_cost": str(line.unit_cost),
+            "unit_cost": str(line.unitcost),
         })
     return {
-        "purchase_order_id": order.pk,
+        "purchase_order_id": order.purchaseid,
         "order_number": order.order_number,
-        "store_id": order.store_id,
+        "store_id": order.storeid_id,
         "store_name": store.storename if store else "Unknown store",
-        "supplier_id": order.supplier_id,
+        "supplier_id": order.supplierid_id,
         "supplier_name": supplier.suppliername if supplier else "Unknown supplier",
-        "status": order.status,
-        "order_date": order.order_date,
+        "status": order.order_status,
+        "order_date": order.purchasedate,
         "expected_date": order.expected_date,
         "notes": order.notes,
         "rejection_reason": order.rejection_reason,
@@ -1696,21 +1629,9 @@ def pending_issue_updates(item_ids):
         .order_by("requestid__requestdate", "requestid_id", "requestitemid")
     )
     for line in lines:
-        decision = RequestDecision.objects.filter(
-            request_id=line.requestid_id,
-            decision="APPROVED",
-        ).first()
-        if decision is None:
+        if line.requestid.decided_at is None or line.quantity_approved is None:
             continue
-        approval = RequestApprovalItem.objects.filter(
-            request_item_id=line.requestitemid
-        ).first()
-        if approval is None:
-            continue
-        issued = RequestIssue.objects.filter(
-            request_item_id=line.requestitemid
-        ).aggregate(total=Sum("quantity"))["total"] or 0
-        remaining = max(0, approval.quantity_approved - issued)
+        remaining = max(0, line.quantity_approved - line.qtyissued)
         if remaining:
             updated.append({
                 "request_id": line.requestid_id,
@@ -1742,13 +1663,15 @@ def purchase_orders(request):
                 {"error": "You are not authorized to view purchase orders."},
                 status=status.HTTP_403_FORBIDDEN,
             )
-        orders = PurchaseOrder.objects.all()
+        orders = Purchase.objects.filter(
+            transaction_type=Purchase.TYPE_ORDER
+        )
         if staff.positionid_id in PURCHASING_POSITION_IDS:
-            orders = orders.filter(created_by_staff_id=staff.staffid)
+            orders = orders.filter(staffid_id=staff.staffid)
         return Response({
             "purchase_orders": [
                 purchase_order_summary(order)
-                for order in orders.order_by("-created_at")
+                for order in orders.order_by("-purchasedate", "-purchaseid")
             ],
         })
 
@@ -1772,7 +1695,15 @@ def purchase_orders(request):
             {"error": "Enter a unique purchase order number of at most 30 characters."},
             status=status.HTTP_400_BAD_REQUEST,
         )
-    if PurchaseOrder.objects.filter(order_number=order_number.strip()).exists():
+    if len(order_number.strip()) > 20:
+        return Response(
+            {"error": "Purchase order number cannot exceed 20 characters."},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+    if Purchase.objects.filter(
+        transaction_type=Purchase.TYPE_ORDER,
+        order_number=order_number.strip(),
+    ).exists():
         return Response(
             {"error": "That purchase order number already exists."},
             status=status.HTTP_409_CONFLICT,
@@ -1856,25 +1787,39 @@ def purchase_orders(request):
         seen_items.add(item_id)
         validated_lines.append((item_id, quantity, unit_cost))
 
+    order_total = sum(
+        (unit_cost * quantity for _, quantity, unit_cost in validated_lines),
+        Decimal("0.000"),
+    ).quantize(Decimal("0.001"))
     with transaction.atomic():
-        order = PurchaseOrder.objects.create(
+        order = Purchase.objects.create(
+            storeid=store,
+            supplierid=supplier,
+            staffid=staff,
+            invoicenumber=f"PO-{uuid.uuid4().hex[:16]}",
             order_number=order_number.strip(),
-            store_id=store.storeid,
-            supplier_id=supplier.supplierid,
-            created_by_staff_id=staff.staffid,
-            status=PurchaseOrder.STATUS_PENDING,
-            order_date=parsed_order_date,
+            invoicedate=parsed_order_date,
+            purchasedate=parsed_order_date,
+            totalamount=order_total,
+            transaction_type=Purchase.TYPE_ORDER,
+            order_status=Purchase.STATUS_PENDING,
             expected_date=parsed_expected_date,
             notes=notes.strip(),
         )
-        PurchaseOrderLine.objects.bulk_create([
-            PurchaseOrderLine(
-                purchase_order=order,
-                item_id=item_id,
-                quantity_ordered=quantity,
-                unit_cost=unit_cost,
+        last_line_id = PurchaseItem.objects.aggregate(
+            max_id=Max("purchaseitemid")
+        )["max_id"] or 0
+        PurchaseItem.objects.bulk_create([
+            PurchaseItem(
+                purchaseitemid=last_line_id + index,
+                purchaseid=order,
+                itemid_id=item_id,
+                quantity=quantity,
+                unitcost=unit_cost,
             )
-            for item_id, quantity, unit_cost in validated_lines
+            for index, (item_id, quantity, unit_cost) in enumerate(
+                validated_lines, start=1
+            )
         ])
 
     return Response({
@@ -1901,9 +1846,10 @@ def pending_purchase_orders(request):
     return Response({
         "purchase_orders": [
             purchase_order_summary(order)
-            for order in PurchaseOrder.objects.filter(
-                status=PurchaseOrder.STATUS_PENDING
-            ).order_by("created_at")
+            for order in Purchase.objects.filter(
+                transaction_type=Purchase.TYPE_ORDER,
+                order_status=Purchase.STATUS_PENDING,
+            ).order_by("purchasedate", "purchaseid")
         ],
     })
 
@@ -1939,33 +1885,36 @@ def decide_purchase_order(request, order_id):
         )
     with transaction.atomic():
         try:
-            order = PurchaseOrder.objects.select_for_update().get(pk=order_id)
-        except PurchaseOrder.DoesNotExist:
+            order = Purchase.objects.select_for_update().get(
+                purchaseid=order_id,
+                transaction_type=Purchase.TYPE_ORDER,
+            )
+        except Purchase.DoesNotExist:
             return Response(
                 {"error": "Purchase order not found."},
                 status=status.HTTP_404_NOT_FOUND,
             )
-        if order.status != PurchaseOrder.STATUS_PENDING:
+        if order.order_status != Purchase.STATUS_PENDING:
             return Response(
                 {"error": "Only pending purchase orders can be decided."},
                 status=status.HTTP_409_CONFLICT,
             )
         order.approved_by_staff_id = staff.staffid
-        order.status = (
-            PurchaseOrder.STATUS_APPROVED
+        order.order_status = (
+            Purchase.STATUS_APPROVED
             if decision == "APPROVED"
-            else PurchaseOrder.STATUS_REJECTED
+            else Purchase.STATUS_REJECTED
         )
         order.rejection_reason = (
             reason.strip() if decision == "REJECTED" else ""
         )
         order.save(update_fields=[
-            "approved_by_staff_id", "status", "rejection_reason"
+            "approved_by_staff_id", "order_status", "rejection_reason"
         ])
     return Response({
-        "message": f"Purchase order {order.status.lower()}.",
-        "purchase_order_id": order.pk,
-        "status": order.status,
+        "message": f"Purchase order {order.order_status.lower()}.",
+        "purchase_order_id": order.purchaseid,
+        "status": order.order_status,
     })
 
 
@@ -2015,12 +1964,13 @@ def receiving_options(request):
     ]
     open_orders = [
         purchase_order_summary(order)
-        for order in PurchaseOrder.objects.filter(
-            status__in=[
-                PurchaseOrder.STATUS_APPROVED,
-                PurchaseOrder.STATUS_PARTIALLY_RECEIVED,
+        for order in Purchase.objects.filter(
+            transaction_type=Purchase.TYPE_ORDER,
+            order_status__in=[
+                Purchase.STATUS_APPROVED,
+                Purchase.STATUS_PARTIALLY_RECEIVED,
             ]
-        ).order_by("order_date", "pk")
+        ).order_by("purchasedate", "purchaseid")
     ]
 
     return Response({
@@ -2156,11 +2106,12 @@ def receive_goods(request):
     try:
         store = Store.objects.get(storeid=store_id)
         supplier = Supplier.objects.get(supplierid=supplier_id)
-        purchase_order = PurchaseOrder.objects.get(
-            pk=purchase_order_id,
-            status__in=[
-                PurchaseOrder.STATUS_APPROVED,
-                PurchaseOrder.STATUS_PARTIALLY_RECEIVED,
+        purchase_order = Purchase.objects.get(
+            purchaseid=purchase_order_id,
+            transaction_type=Purchase.TYPE_ORDER,
+            order_status__in=[
+                Purchase.STATUS_APPROVED,
+                Purchase.STATUS_PARTIALLY_RECEIVED,
             ],
         )
     except (Store.DoesNotExist, Supplier.DoesNotExist):
@@ -2168,15 +2119,15 @@ def receive_goods(request):
             {"error": "The selected store or supplier does not exist."},
             status=status.HTTP_400_BAD_REQUEST,
         )
-    except PurchaseOrder.DoesNotExist:
+    except Purchase.DoesNotExist:
         return Response(
             {"error": "Select an approved purchase order with goods still outstanding."},
             status=status.HTTP_400_BAD_REQUEST,
         )
 
     if (
-        purchase_order.store_id != store.storeid
-        or purchase_order.supplier_id != supplier.supplierid
+        purchase_order.storeid_id != store.storeid
+        or purchase_order.supplierid_id != supplier.supplierid
     ):
         return Response(
             {"error": "Store and supplier must match the selected purchase order."},
@@ -2264,13 +2215,17 @@ def receive_goods(request):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        order_line = PurchaseOrderLine.objects.filter(
-            purchase_order=purchase_order,
-            item_id=item_id,
+        order_line = PurchaseItem.objects.filter(
+            purchaseid=purchase_order,
+            itemid_id=item_id,
         ).first()
+        already_received = PurchaseItem.objects.filter(
+            purchaseid__parent_purchase_id=purchase_order.purchaseid,
+            itemid_id=item_id,
+        ).aggregate(total=Sum("quantity"))["total"] or 0
         if (
             order_line is None
-            or order_line.quantity_ordered - order_line.quantity_received < quantity
+            or order_line.quantity - already_received < quantity
         ):
             return Response(
                 {"error": f"{item.itemname} quantity exceeds the amount remaining on the purchase order."},
@@ -2308,29 +2263,33 @@ def receive_goods(request):
                     status=status.HTTP_400_BAD_REQUEST,
                 )
 
-            locked_order = PurchaseOrder.objects.select_for_update().get(
-                pk=purchase_order.pk
+            locked_order = Purchase.objects.select_for_update().get(
+                purchaseid=purchase_order.purchaseid,
+                transaction_type=Purchase.TYPE_ORDER,
             )
-            if locked_order.status not in {
-                PurchaseOrder.STATUS_APPROVED,
-                PurchaseOrder.STATUS_PARTIALLY_RECEIVED,
+            if locked_order.order_status not in {
+                Purchase.STATUS_APPROVED,
+                Purchase.STATUS_PARTIALLY_RECEIVED,
             }:
                 return Response(
                     {"error": "This purchase order is no longer open for receiving."},
                     status=status.HTTP_409_CONFLICT,
                 )
             locked_order_lines = {
-                line.item_id: line
-                for line in PurchaseOrderLine.objects.select_for_update().filter(
-                    purchase_order=locked_order
+                line.itemid_id: line
+                for line in PurchaseItem.objects.select_for_update().filter(
+                    purchaseid=locked_order
                 )
             }
             for entry in validated_items:
                 order_line = locked_order_lines.get(entry["item_id"])
+                already_received = PurchaseItem.objects.filter(
+                    purchaseid__parent_purchase_id=locked_order.purchaseid,
+                    itemid_id=entry["item_id"],
+                ).aggregate(total=Sum("quantity"))["total"] or 0
                 if (
                     order_line is None
-                    or order_line.quantity_ordered - order_line.quantity_received
-                    < entry["quantity"]
+                    or order_line.quantity - already_received < entry["quantity"]
                 ):
                     return Response(
                         {"error": "The requested delivery quantity exceeds the remaining purchase order quantity. Refresh and try again."},
@@ -2345,6 +2304,8 @@ def receive_goods(request):
                 invoicedate=parsed_dates["invoice_date"],
                 purchasedate=parsed_dates["purchase_date"],
                 totalamount=total_amount,
+                transaction_type=Purchase.TYPE_RECEIPT,
+                parent_purchase=locked_order,
             )
 
             # PurchaseItemID is the primary key in the existing table.
@@ -2357,8 +2318,8 @@ def receive_goods(request):
                     purchaseitemid=last_line + offset,
                     purchaseid=purchase,
                     itemid_id=entry["item_id"],
-                    unitcost=entry["unit_cost"],
                     quantity=entry["quantity"],
+                    unitcost=entry["unit_cost"],
                 )
 
             grn = Grn.objects.create(
@@ -2368,26 +2329,20 @@ def receive_goods(request):
                 staffid=staff,
                 remarks=remarks.strip(),
             )
-            PurchaseOrderReceipt.objects.create(
-                purchase_order=locked_order,
-                purchase_id=purchase.purchaseid,
+            all_order_lines = list(locked_order_lines.values())
+            all_received = all(
+                (PurchaseItem.objects.filter(
+                    purchaseid__parent_purchase_id=locked_order.purchaseid,
+                    itemid_id=line.itemid_id,
+                ).aggregate(total=Sum("quantity"))["total"] or 0)
+                >= line.quantity
+                for line in all_order_lines
             )
-
-            for entry in validated_items:
-                order_line = locked_order_lines[entry["item_id"]]
-                order_line.quantity_received += entry["quantity"]
-                order_line.save(update_fields=["quantity_received"])
-
-            all_order_lines = list(
-                PurchaseOrderLine.objects.filter(
-                    purchase_order=locked_order
-                ).values_list("quantity_ordered", "quantity_received")
-            )
-            if all(received >= ordered for ordered, received in all_order_lines):
-                locked_order.status = PurchaseOrder.STATUS_RECEIVED
+            if all_received:
+                locked_order.order_status = Purchase.STATUS_RECEIVED
             else:
-                locked_order.status = PurchaseOrder.STATUS_PARTIALLY_RECEIVED
-            locked_order.save(update_fields=["status"])
+                locked_order.order_status = Purchase.STATUS_PARTIALLY_RECEIVED
+            locked_order.save(update_fields=["order_status"])
 
             # Lock each stock row and audit every stock increase.
             for entry in validated_items:
@@ -2414,6 +2369,7 @@ def receive_goods(request):
                         f"{remarks.strip()}"
                     ).strip(),
                     changed_by=request.user,
+                    changed_by_staff_id=staff.staffid,
                 )
 
     except IntegrityError:
@@ -2436,7 +2392,7 @@ def receive_goods(request):
             "invoice_number": purchase.invoicenumber,
             "total_amount": str(purchase.totalamount),
             "items_received": len(validated_items),
-            "purchase_order_status": locked_order.status,
+            "purchase_order_status": locked_order.order_status,
             "pending_issue_updates": pending_issue_updates(
                 {entry["item_id"] for entry in validated_items}
             ),
@@ -2581,25 +2537,24 @@ def reports_dashboard(request):
         total_requested=Sum("qtyrequested"),
     )
     request_totals["total_approved"] = (
-        RequestApprovalItem.objects.aggregate(
-            total=Sum("quantity_approved")
-        )["total"] or 0
+        RequestItem.objects.aggregate(total=Sum("quantity_approved"))["total"]
+        or 0
     )
     request_totals["total_issued"] = (
-        RequestIssue.objects.aggregate(total=Sum("quantity"))["total"] or 0
+        RequestItem.objects.aggregate(total=Sum("qtyissued"))["total"] or 0
     )
     request_totals["legacy_requests_needing_review"] = (
         Request.objects.filter(
             statusid__statusname__in=[
                 "Approved", "Partially Issued", "Issued"
             ]
-        ).exclude(
-            requestid__in=RequestDecision.objects.values("request_id")
-        ).count()
+        ).filter(decided_at__isnull=True, legacy_reviewed_at__isnull=True).count()
     )
 
     monthly_purchases = list(
-        Purchase.objects.annotate(
+        Purchase.objects.filter(
+            transaction_type=Purchase.TYPE_RECEIPT
+        ).annotate(
             month=TruncMonth("purchasedate")
         ).values("month").annotate(
             purchase_count=Count("purchaseid"),
@@ -2608,7 +2563,9 @@ def reports_dashboard(request):
     )
 
     supplier_totals = list(
-        Purchase.objects.values(
+        Purchase.objects.filter(
+            transaction_type=Purchase.TYPE_RECEIPT
+        ).values(
             "supplierid", "supplierid__suppliername"
         ).annotate(
             purchase_count=Count("purchaseid"),
@@ -2723,10 +2680,6 @@ def staff_management(request):
             and account.user.has_usable_password()
             for account in StaffAccount.objects.select_related("user")
         }
-        email_by_staff = dict(
-            StaffContact.objects.values_list("staff_id", "email")
-        )
-
         departments = Department.objects.order_by(
             "departmentid"
         ).values("departmentid", "departmentname")
@@ -2746,7 +2699,7 @@ def staff_management(request):
                     "position_id": person.positionid_id,
                     "position": person.positionid.positionname,
                     "contact": person.contact,
-                    "email": email_by_staff.get(person.staffid, ""),
+                    "email": person.email or "",
                     "login_ready": account_by_staff.get(person.staffid, False),
                 }
                 for person in staff_members
@@ -2824,10 +2777,8 @@ def staff_management(request):
                 last_name=surname.strip(),
             )
             StaffAccount.objects.create(user=user, staff=person)
-            StaffContact.objects.create(
-                staff_id=person.staffid,
-                email=email.strip(),
-            )
+            person.email = email.strip()
+            person.save(update_fields=["email"])
             send_account_setup_email(user, email.strip())
     except (RuntimeError, OSError, smtplib.SMTPException) as error:
         return Response(
@@ -2861,11 +2812,15 @@ def resend_staff_setup_email(request, staff_id):
         account = StaffAccount.objects.select_related("user", "staff").get(
             staff_id=staff_id
         )
-        contact = StaffContact.objects.get(staff_id=staff_id)
-    except (StaffAccount.DoesNotExist, StaffContact.DoesNotExist):
+    except StaffAccount.DoesNotExist:
         return Response(
             {"error": "No invited login account was found for this staff member."},
             status=status.HTTP_404_NOT_FOUND,
+        )
+    if not account.staff.email:
+        return Response(
+            {"error": "No email address is recorded for this staff member."},
+            status=status.HTTP_409_CONFLICT,
         )
     if account.user.has_usable_password():
         return Response(
@@ -2873,13 +2828,15 @@ def resend_staff_setup_email(request, staff_id):
             status=status.HTTP_409_CONFLICT,
         )
     try:
-        send_account_setup_email(account.user, contact.email)
+        send_account_setup_email(account.user, account.staff.email)
     except (RuntimeError, OSError, smtplib.SMTPException) as error:
         return Response(
             {"error": f"The setup email could not be sent: {error}"},
             status=status.HTTP_503_SERVICE_UNAVAILABLE,
         )
-    return Response({"message": f"A new setup link was sent to {contact.email}."})
+    return Response({
+        "message": f"A new setup link was sent to {account.staff.email}."
+    })
 
 
 @api_view(["GET", "POST"])
@@ -3141,12 +3098,6 @@ def delete_inventory_item(request, item_id):
             status=status.HTTP_409_CONFLICT,
         )
 
-    if ItemArchive.objects.filter(item_id=item_id).exists():
-        return Response(
-            {"error": "This item cannot be deleted because it has archive history."},
-            status=status.HTTP_409_CONFLICT,
-        )
-
     if item.quantity != 0:
         return Response(
             {"error": "Only items with zero stock can be deleted."},
@@ -3202,34 +3153,45 @@ def set_item_archive_state(request, item_id):
         )
 
     if action == "ARCHIVED":
-        approved_lines = RequestApprovalItem.objects.filter(
-            request_item_id__in=RequestItem.objects.filter(
-                itemid_id=item_id
-            ).values("requestitemid")
-        )
-        has_pending_issue = False
-        for approval in approved_lines:
-            issued = RequestIssue.objects.filter(
-                request_item_id=approval.request_item_id
-            ).aggregate(total=Sum("quantity"))["total"] or 0
-            legacy = RequestLegacyReview.objects.filter(
-                request_item_id=approval.request_item_id
-            ).values_list("quantity_previously_issued", flat=True).first() or 0
-            if issued + legacy < approval.quantity_approved:
-                has_pending_issue = True
-                break
-        if has_pending_issue:
-            return Response(
-                {"error": "This item has approved quantities awaiting issue. Complete or resolve them before archiving."},
-                status=status.HTTP_409_CONFLICT,
-            )
+        request_lines = RequestItem.objects.filter(
+            itemid_id=item_id
+        ).select_related("requestid", "requestid__statusid")
+        for line in request_lines:
+            if legacy_approval_requires_review(line.requestid):
+                return Response(
+                    {"error": "This item has a legacy request awaiting review. Resolve it before archiving."},
+                    status=status.HTTP_409_CONFLICT,
+                )
+            if (
+                line.quantity_approved is not None
+                and line.qtyissued < line.quantity_approved
+            ):
+                return Response(
+                    {"error": "This item has approved quantities awaiting issue. Complete or resolve them before archiving."},
+                    status=status.HTTP_409_CONFLICT,
+                )
 
-    ItemArchive.objects.create(
-        item_id=item.itemid,
-        action=action,
-        archived_by_staff_id=staff.staffid,
-        reason=reason.strip(),
-    )
+    old_archived = item.is_archived
+    item.is_archived = action == "ARCHIVED"
+    item.archived_by_staff_id = staff.staffid if item.is_archived else None
+    item.archived_at = timezone.now() if item.is_archived else None
+    item.archive_reason = reason.strip() if item.is_archived else None
+    with transaction.atomic():
+        item.save(update_fields=[
+            "is_archived", "archived_by_staff_id", "archived_at",
+            "archive_reason",
+        ])
+        InventoryAudit.objects.create(
+            item_id=item.itemid,
+            item_name=item.itemname,
+            action=action,
+            field_changed="is_archived",
+            old_value=str(old_archived),
+            new_value=str(item.is_archived),
+            comments=reason.strip(),
+            changed_by=request.user,
+            changed_by_staff_id=staff.staffid,
+        )
     return Response({
         "message": (
             "Item archived. It is hidden from new requests and receiving."
