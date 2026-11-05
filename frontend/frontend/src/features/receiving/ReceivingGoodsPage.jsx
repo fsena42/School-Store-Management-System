@@ -13,6 +13,7 @@ function today() {
 
 function emptyForm() {
   return {
+    purchase_order_id: '',
     store_id: '',
     supplier_id: '',
     invoice_number: '',
@@ -24,11 +25,12 @@ function emptyForm() {
   }
 }
 
-export default function ReceivingGoodsPage({ onBack }) {
+export default function ReceivingGoodsPage({ onBack, onViewIssues }) {
   const [options, setOptions] = useState({
     stores: [],
     suppliers: [],
     items: [],
+    purchase_orders: [],
   })
   const [form, setForm] = useState(emptyForm)
   const [lines, setLines] = useState([])
@@ -36,6 +38,11 @@ export default function ReceivingGoodsPage({ onBack }) {
   const [saving, setSaving] = useState(false)
   const [error, setError] = useState('')
   const [success, setSuccess] = useState('')
+  const [pendingIssueUpdates, setPendingIssueUpdates] = useState([])
+
+  const selectedOrder = options.purchase_orders.find(
+    (order) => String(order.purchase_order_id) === String(form.purchase_order_id)
+  )
 
   useEffect(() => {
     let active = true
@@ -58,12 +65,13 @@ export default function ReceivingGoodsPage({ onBack }) {
   }, [])
 
   const availableItems = useMemo(() => {
-    return options.items.filter(
-      (item) =>
-        String(item.store_id) === String(form.store_id) &&
-        !lines.some((line) => String(line.item_id) === String(item.item_id)),
-    )
-  }, [options.items, form.store_id, lines])
+    return (selectedOrder?.lines || [])
+      .filter((line) =>
+        line.quantity_remaining > 0 &&
+        !lines.some((entry) => String(entry.item_id) === String(line.item_id))
+      )
+      .map((line) => ({ ...line, store_id: selectedOrder.store_id }))
+  }, [selectedOrder, lines])
 
   const total = lines.reduce(
     (sum, line) => sum + Number(line.quantity || 0) * Number(line.unit_cost || 0),
@@ -82,6 +90,23 @@ export default function ReceivingGoodsPage({ onBack }) {
     }
   }
 
+  function handleOrderChange(event) {
+    const orderId = event.target.value
+    const order = options.purchase_orders.find(
+      (entry) => String(entry.purchase_order_id) === orderId
+    )
+    setForm((previous) => ({
+      ...previous,
+      purchase_order_id: orderId,
+      store_id: order ? String(order.store_id) : '',
+      supplier_id: order ? String(order.supplier_id) : '',
+    }))
+    setLines([])
+    setPendingIssueUpdates([])
+    setError('')
+    setSuccess('')
+  }
+
   function addLine() {
     if (!form.store_id) {
       setError('Select a store before adding items.')
@@ -98,11 +123,12 @@ export default function ReceivingGoodsPage({ onBack }) {
       {
         item_id: String(availableItems[0].item_id),
         quantity: '1',
-        unit_cost: '',
+        unit_cost: availableItems[0].unit_cost,
       },
     ])
     setError('')
     setSuccess('')
+    setPendingIssueUpdates([])
   }
 
   function updateLine(index, field, value) {
@@ -113,6 +139,7 @@ export default function ReceivingGoodsPage({ onBack }) {
     )
     setError('')
     setSuccess('')
+    setPendingIssueUpdates([])
   }
 
   function removeLine(index) {
@@ -159,6 +186,7 @@ export default function ReceivingGoodsPage({ onBack }) {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           ...form,
+          purchase_order_id: Number(form.purchase_order_id),
           store_id: Number(form.store_id),
           supplier_id: Number(form.supplier_id),
           items: payloadItems,
@@ -166,15 +194,18 @@ export default function ReceivingGoodsPage({ onBack }) {
       })
 
       setSuccess(
-        `${result.message} GRN: ${result.grn_number}. Total: ${Number(
+        `${result.message} GRN: ${result.grn_number}. Order status: ${result.purchase_order_status}. Total: ${Number(
           result.total_amount,
         ).toLocaleString(undefined, {
           minimumFractionDigits: 2,
           maximumFractionDigits: 2,
         })}.`,
       )
+      setPendingIssueUpdates(result.pending_issue_updates || [])
       setForm(emptyForm())
       setLines([])
+      const refreshed = await apiRequest('/receiving/options/')
+      setOptions(refreshed)
     } catch (err) {
       setError(err.message || 'Goods could not be recorded.')
     } finally {
@@ -219,20 +250,39 @@ export default function ReceivingGoodsPage({ onBack }) {
           {success}
         </div>
       )}
+      {pendingIssueUpdates.length > 0 && (
+        <div className="receiving-message receiving-success">
+          <strong>Restock follow-up:</strong>{' '}
+          {pendingIssueUpdates.length} approved item line(s) can now be checked
+          for pending issue.
+          <ul>
+            {pendingIssueUpdates.map((entry) => (
+              <li key={`${entry.request_id}-${entry.item_name}`}>
+                Request #{entry.request_id} · {entry.requester} · {entry.item_name}:
+                {' '}{entry.quantity_remaining} approved remaining, {entry.quantity_in_stock} now in stock
+              </li>
+            ))}
+          </ul>
+          <button type="button" onClick={onViewIssues}>Open pending issues</button>
+        </div>
+      )}
 
       <form onSubmit={handleSubmit}>
         <ReceivingHeaderPage
           form={form}
           onChange={handleHeaderChange}
+          onOrderChange={handleOrderChange}
           stores={options.stores}
           suppliers={options.suppliers}
+          purchaseOrders={options.purchase_orders}
+          selectedOrder={selectedOrder}
         />
 
         <section className="receiving-panel">
           <div className="receiving-section-heading">
             <div>
               <h2>Items received</h2>
-              <p>Add each item and enter the delivered quantity and unit cost.</p>
+              <p>Select an approved order, then enter quantities actually delivered.</p>
             </div>
 
             <button
@@ -247,7 +297,7 @@ export default function ReceivingGoodsPage({ onBack }) {
 
           {lines.length === 0 ? (
             <div className="receiving-empty">
-              No items added yet. Select a store, then click <strong>Add item</strong>.
+              No items added yet. Select an approved order, then click <strong>Add item</strong>.
             </div>
           ) : (
             <div className="receiving-table-wrap">
@@ -265,6 +315,8 @@ export default function ReceivingGoodsPage({ onBack }) {
                 <tbody>
                   {lines.map((line, index) => {
                     const selectedItem = options.items.find(
+                      (item) => String(item.item_id) === String(line.item_id),
+                    ) || selectedOrder?.lines.find(
                       (item) => String(item.item_id) === String(line.item_id),
                     )
                     const subtotal =
@@ -305,6 +357,7 @@ export default function ReceivingGoodsPage({ onBack }) {
                             min="1"
                             step="1"
                             value={line.quantity}
+                            max={selectedItem?.quantity_remaining}
                             onChange={(event) =>
                               updateLine(index, 'quantity', event.target.value)
                             }

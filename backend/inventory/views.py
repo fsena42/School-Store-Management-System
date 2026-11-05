@@ -1,9 +1,18 @@
 
 from datetime import date
 
-from django.contrib.auth import authenticate, login
+from django.conf import settings
+from django.contrib.auth import authenticate, login, logout
+from django.contrib.auth.password_validation import validate_password
+from django.contrib.auth.tokens import default_token_generator
+from django.contrib.auth import get_user_model
 from django.db import transaction
-from django.db.models import Exists, OuterRef
+from django.db.models import Exists, OuterRef, Sum
+from django.core.mail import send_mail
+from django.core.exceptions import ValidationError
+from django.core.validators import validate_email
+from django.utils.encoding import force_bytes
+from django.utils.http import urlsafe_base64_encode, urlsafe_base64_decode
 
 from django.middleware.csrf import get_token
 from django.views.decorators.csrf import ensure_csrf_cookie
@@ -13,14 +22,30 @@ from rest_framework.decorators import api_view, permission_classes
 from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
 
-from .models import Request, RequestItem, Status, StaffAccount, Staff, Department, Position, Store, Item, Unit, InventoryAudit
+from .models import (
+    Request, RequestItem, Status, StaffAccount, Staff, Department, Position,
+    Store, Item, Unit, InventoryAudit, RequestDecision, RequestApprovalItem,
+    RequestIssue, ItemArchive, StaffContact, PurchaseOrder, PurchaseOrderLine,
+    PurchaseOrderReceipt, RequestLegacyReview,
+)
 from .serializers import RequestSerializer
+from .permissions import (
+    APPROVER_POSITION_IDS,
+    INVENTORY_MAINTAINER_POSITION_IDS,
+    INVENTORY_VIEW_POSITION_IDS,
+    ISSUER_POSITION_IDS,
+    MANAGEMENT_POSITION_IDS,
+    PURCHASE_ORDER_APPROVER_POSITION_IDS,
+    PURCHASING_POSITION_IDS,
+    REQUESTABLE_STORES_BY_POSITION,
+)
 
 from decimal import Decimal, InvalidOperation
+import smtplib
 from django.db import IntegrityError
 from django.db.models import Max
 
-from django.db.models import Count, Sum
+from django.db.models import Count
 from django.db.models.functions import TruncMonth
 
 from .models import Purchase, PurchaseItem, Grn, Supplier
@@ -154,6 +179,91 @@ def check_session(request):
         "position": staff.positionid.positionname,
     })
 
+
+@api_view(["POST"])
+@permission_classes([IsAuthenticated])
+def staff_logout(request):
+    logout(request)
+    return Response({"message": "Signed out successfully."})
+
+
+def send_account_setup_email(user, email):
+    if not settings.EMAIL_HOST or not settings.DEFAULT_FROM_EMAIL:
+        raise RuntimeError(
+            "Email delivery is not configured. Set EMAIL_HOST and "
+            "DEFAULT_FROM_EMAIL before inviting staff."
+        )
+
+    uid = urlsafe_base64_encode(force_bytes(user.pk))
+    token = default_token_generator.make_token(user)
+    frontend_url = getattr(settings, "FRONTEND_URL", "http://127.0.0.1:5173")
+    setup_url = (
+        f"{frontend_url.rstrip('/')}?setup=1&uid={uid}&token={token}"
+    )
+    send_mail(
+        "Set up your school store account",
+        (
+            "A school store account was created for you. Open this one-time "
+            f"link to choose a password: {setup_url}"
+        ),
+        settings.DEFAULT_FROM_EMAIL,
+        [email],
+        fail_silently=False,
+    )
+
+
+def archived_item_ids():
+    latest_action_by_item = {}
+    for event in ItemArchive.objects.order_by("-archived_at", "-pk"):
+        latest_action_by_item.setdefault(event.item_id, event.action)
+    return {
+        item_id
+        for item_id, action in latest_action_by_item.items()
+        if action == "ARCHIVED"
+    }
+
+
+@api_view(["POST"])
+@permission_classes([AllowAny])
+def complete_staff_account_setup(request):
+    uid = request.data.get("uid")
+    token = request.data.get("token")
+    password = request.data.get("password")
+
+    if not all(isinstance(value, str) and value for value in (uid, token, password)):
+        return Response(
+            {"error": "A valid setup link and password are required."},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+
+    try:
+        user_id = urlsafe_base64_decode(uid).decode()
+        user = get_user_model().objects.get(pk=user_id, is_active=True)
+    except (ValueError, TypeError, UnicodeDecodeError, get_user_model().DoesNotExist):
+        return Response(
+            {"error": "This account setup link is invalid or expired."},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+
+    if not default_token_generator.check_token(user, token):
+        return Response(
+            {"error": "This account setup link is invalid or expired."},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+
+    try:
+        validate_password(password, user)
+    except ValidationError as error:
+        return Response(
+            {"error": " ".join(error.messages)},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+
+    user.set_password(password)
+    user.save(update_fields=["password"])
+    return Response({"message": "Password set. You can now sign in."})
+
+
 @api_view(["GET"])
 @permission_classes([AllowAny])
 @ensure_csrf_cookie
@@ -175,15 +285,7 @@ def dashboard(request):
 
     position_id = staff.positionid_id
 
-    allowed_stores = {
-        1: [3],        # Teacher
-        2: [1],        # Cleaner
-        4: [1],        # Support Staff
-        8: [1, 2, 3],  # Procurement Officer
-        9: [1, 2],     # Chef
-    }
-
-    store_ids = allowed_stores.get(position_id, [])
+    store_ids = REQUESTABLE_STORES_BY_POSITION.get(position_id, ())
 
     stores = list(
         Store.objects.filter(storeid__in=store_ids)
@@ -198,7 +300,9 @@ def dashboard(request):
             "position": staff.positionid.positionname,
         },
         "stores": stores,
-        "can_approve": position_id in [5, 6, 7],
+        "can_approve": position_id in APPROVER_POSITION_IDS,
+        "can_issue": position_id in ISSUER_POSITION_IDS,
+        "can_manage_purchase_orders": position_id in PURCHASING_POSITION_IDS,
     })
 
 
@@ -217,9 +321,7 @@ def inventory_list(request):
     # Only these positions may view inventory:
     # 5 = Principal, 6 = Deputy Principal,
     # 7 = Store Manager, 8 = Procurement Officer.
-    allowed_positions = [5, 6, 7, 8]
-
-    if staff.positionid_id not in allowed_positions:
+    if staff.positionid_id not in INVENTORY_VIEW_POSITION_IDS:
         return Response(
             {"error": "You are not authorized to view inventory."},
             status=status.HTTP_403_FORBIDDEN,
@@ -240,6 +342,7 @@ def inventory_list(request):
     ).order_by("itemid")
 
     results = []
+    archived_ids = archived_item_ids()
     for item in items:
         if item.has_request_history:
             delete_block_reason = (
@@ -252,6 +355,10 @@ def inventory_list(request):
         elif item.has_audit_history:
             delete_block_reason = (
                 "This item cannot be deleted because it has audit history."
+            )
+        elif ItemArchive.objects.filter(item_id=item.itemid).exists():
+            delete_block_reason = (
+                "This item cannot be deleted because it has archive history."
             )
         elif item.quantity != 0:
             delete_block_reason = "Only items with zero stock can be deleted."
@@ -266,6 +373,7 @@ def inventory_list(request):
             "unit_id": item.unitid_id,
             "quantity": item.quantity,
             "reorder_level": item.reorderlevel,
+            "is_archived": item.itemid in archived_ids,
             "delete_block_reason": delete_block_reason,
         })
 
@@ -288,8 +396,7 @@ def edit_inventory_item(request, item_id):
             status=status.HTTP_403_FORBIDDEN,
         )
 
-    # Only the Principal (5) and Store Manager (7) may edit inventory.
-    if staff.positionid_id not in [5, 7]:
+    if staff.positionid_id not in INVENTORY_MAINTAINER_POSITION_IDS:
         return Response(
             {"error": "Only the Principal or Store Manager can edit inventory."},
             status=status.HTTP_403_FORBIDDEN,
@@ -378,7 +485,11 @@ def edit_inventory_item(request, item_id):
             InventoryAudit.objects.create(
                 item_id=item.itemid,
                 item_name=item.itemname,
-                action="EDIT",
+                action=(
+                    "STOCK_ADJUSTMENT"
+                    if model_field == "quantity"
+                    else "EDIT"
+                ),
                 field_changed=audit_field,
                 old_value=str(old_value),
                 new_value=str(new_value),
@@ -428,6 +539,15 @@ def my_requests(request):
             .select_related("itemid")
         )
 
+        decision = RequestDecision.objects.filter(
+            request_id=req.requestid
+        ).first()
+        legacy_decision = (
+            decision is None
+            and req.statusid.statusname.lower()
+            in {"approved", "partially issued", "issued"}
+        )
+
         results.append({
             "request_id": req.requestid,
             "store_id": req.storeid_id,
@@ -435,18 +555,50 @@ def my_requests(request):
             "request_date": req.requestdate,
             "status_id": req.statusid_id,
             "status": req.statusid.statusname,
+            "decision_reason": decision.reason if decision else "",
+            "legacy_review_required": legacy_decision,
             "items": [
-                {
-                    "item_id": line.itemid_id,
-                    "item_name": line.itemid.itemname,
-                    "quantity_requested": line.qtyrequested,
-                    "quantity_issued": line.qtyissued,
-                }
+                request_item_summary(line, legacy_decision)
                 for line in request_items
             ],
         })
 
     return Response({"requests": results})
+
+
+def request_item_summary(line, legacy_review_required=False):
+    approval = RequestApprovalItem.objects.filter(
+        request_item_id=line.requestitemid
+    ).first()
+    issued = RequestIssue.objects.filter(
+        request_item_id=line.requestitemid
+    ).aggregate(total=Sum("quantity"))["total"] or 0
+    legacy_review = RequestLegacyReview.objects.filter(
+        request_item_id=line.requestitemid
+    ).first()
+    if legacy_review:
+        issued += legacy_review.quantity_previously_issued
+
+    if legacy_review_required:
+        approved = line.qtyissued
+        remaining = 0
+    else:
+        approved = approval.quantity_approved if approval else 0
+        remaining = max(0, approved - issued)
+
+    return {
+        "request_item_id": line.requestitemid,
+        "item_id": line.itemid_id,
+        "item_name": line.itemid.itemname,
+        "quantity_requested": line.qtyrequested,
+        "quantity_approved": approved,
+        "quantity_issued": issued,
+        "quantity_remaining": remaining,
+        "legacy_review_required": legacy_review_required,
+        "legacy_quantity_recorded": (
+            line.qtyissued if legacy_review_required else None
+        ),
+    }
 
 
 @api_view(["POST"])
@@ -655,6 +807,23 @@ def submit_request_draft(request, request_id):
             status=status.HTTP_400_BAD_REQUEST,
         )
 
+    draft_lines = list(RequestItem.objects.filter(requestid=draft))
+    serializer = RequestSerializer(
+        data={
+            "store_id": draft.storeid_id,
+            "items": [
+                {"item_id": line.itemid_id, "quantity": line.qtyrequested}
+                for line in draft_lines
+            ],
+        },
+        context={"staff": staff},
+    )
+    if not serializer.is_valid():
+        return Response(
+            {"error": "This draft is no longer valid. Update it before submitting.", "details": serializer.errors},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+
     draft.statusid = pending_status
     draft.save(update_fields=["statusid"])
 
@@ -675,20 +844,13 @@ def requestable_items(request):
             status=status.HTTP_403_FORBIDDEN,
         )
 
-    allowed_stores = {
-        1: [3],       # Teacher → Scholastics
-        2: [1],       # Cleaner → Cleaning
-        4: [1],       # Support Staff → Cleaning
-        5: [1, 2, 3], # Principal → all stores
-        8: [1, 2, 3], # Procurement Officer → all stores
-        9: [1, 2],    # Chef → Cleaning and Food
-    }
+    store_ids = REQUESTABLE_STORES_BY_POSITION.get(staff.positionid_id, ())
 
-    store_ids = allowed_stores.get(staff.positionid_id, [])
-
+    archived_ids = archived_item_ids()
     items = (
         Item.objects
         .filter(storeid_id__in=store_ids)
+        .exclude(itemid__in=archived_ids)
         .select_related("storeid")
         .order_by("itemid")
     )
@@ -718,7 +880,7 @@ def pending_requests(request):
         )
 
     # Only authorized positions may review requests.
-    if staff.positionid_id not in [5, 6, 7]:
+    if staff.positionid_id not in APPROVER_POSITION_IDS:
         return Response(
             {"error": "You are not authorized to review requests."},
             status=status.HTTP_403_FORBIDDEN,
@@ -767,12 +929,64 @@ def pending_requests(request):
                     "item_id": line.itemid_id,
                     "item_name": line.itemid.itemname,
                     "quantity_requested": line.qtyrequested,
-                    "quantity_issued": line.qtyissued,
+                    "quantity_in_stock": line.itemid.quantity,
                 }
                 for line in lines
             ],
         })
 
+    return Response({"requests": results})
+
+
+@api_view(["GET"])
+@permission_classes([IsAuthenticated])
+def request_issue_history(request):
+    try:
+        staff = request.user.staff_account.staff
+    except (StaffAccount.DoesNotExist, AttributeError):
+        return Response(
+            {"error": "No staff account is linked to this user."},
+            status=status.HTTP_403_FORBIDDEN,
+        )
+    if staff.positionid_id not in (*APPROVER_POSITION_IDS, *ISSUER_POSITION_IDS):
+        return Response(
+            {"error": "You are not authorized to view request issue progress."},
+            status=status.HTTP_403_FORBIDDEN,
+        )
+
+    requests = (
+        Request.objects.exclude(statusid__statusname__iexact="Draft")
+        .select_related("statusid", "staffid", "storeid")
+        .order_by("-requestdate", "-requestid")
+    )
+    results = []
+    for req in requests:
+        lines = list(
+            RequestItem.objects.filter(requestid=req)
+            .select_related("itemid")
+            .order_by("requestitemid")
+        )
+        decision = RequestDecision.objects.filter(
+            request_id=req.requestid
+        ).first()
+        legacy = (
+            decision is None
+            and req.statusid.statusname.lower()
+            in {"approved", "partially issued", "issued"}
+        )
+        results.append({
+            "request_id": req.requestid,
+            "request_date": req.requestdate,
+            "requester": f"{req.staffid.othernames} {req.staffid.surname}".strip(),
+            "store_name": req.storeid.storename,
+            "status": req.statusid.statusname,
+            "decision_reason": decision.reason if decision else "",
+            "legacy_review_required": legacy,
+            "items": [
+                request_item_summary(line, legacy)
+                for line in lines
+            ],
+        })
     return Response({"requests": results})
 
 
@@ -787,13 +1001,19 @@ def approve_request(request, request_id):
             status=status.HTTP_403_FORBIDDEN,
         )
 
-    if staff.positionid_id not in [5, 6, 7]:
+    if staff.positionid_id not in APPROVER_POSITION_IDS:
         return Response(
             {"error": "You are not authorized to approve requests."},
             status=status.HTTP_403_FORBIDDEN,
         )
 
     approved_items = request.data.get("items")
+    reason = request.data.get("reason", "")
+    if not isinstance(reason, str):
+        return Response(
+            {"error": "Approval notes must be text."},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
 
     if not isinstance(approved_items, list) or not approved_items:
         return Response(
@@ -818,6 +1038,12 @@ def approve_request(request, request_id):
             return Response(
                 {"error": "Only pending requests can be approved."},
                 status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        if RequestDecision.objects.filter(request_id=req.requestid).exists():
+            return Response(
+                {"error": "This request already has a recorded decision."},
+                status=status.HTTP_409_CONFLICT,
             )
 
         lines = list(
@@ -871,7 +1097,21 @@ def approve_request(request, request_id):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        partially_approved = False
+        if not any(submitted.get(line.requestitemid, 0) > 0 for line in lines):
+            return Response(
+                {"error": "Approve at least one item quantity, or reject the request."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        approved_status_name = "Approved"
+        new_status = Status.objects.filter(
+            statusname__iexact=approved_status_name
+        ).first()
+        if new_status is None:
+            return Response(
+                {"error": "Approved status is not configured."},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
 
         for line in lines:
             quantity = submitted[line.requestitemid]
@@ -888,38 +1128,453 @@ def approve_request(request, request_id):
                     status=status.HTTP_400_BAD_REQUEST,
                 )
 
-            if quantity < line.qtyrequested:
-                partially_approved = True
-
-            # Project convention: qtyissued stores the approved quantity.
-            line.qtyissued = quantity
-
-        approved_status_name = (
-            "Partially Issued" if partially_approved else "Approved"
-        )
-
-        new_status = Status.objects.filter(
-            statusname__iexact=approved_status_name
-        ).first()
-
-        if new_status is None:
-            return Response(
-                {"error": f"{approved_status_name} status is not configured."},
-                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        for line in lines:
+            RequestApprovalItem.objects.create(
+                request_item_id=line.requestitemid,
+                quantity_approved=submitted[line.requestitemid],
             )
 
-        RequestItem.objects.bulk_update(lines, ["qtyissued"])
+        RequestDecision.objects.create(
+            request_id=req.requestid,
+            decision="APPROVED",
+            reason=reason.strip(),
+            decided_by_staff_id=staff.staffid,
+        )
 
         req.statusid = new_status
         req.approvedby = staff
         req.save(update_fields=["statusid", "approvedby"])
 
     return Response({
-        "message": "Request quantities approved successfully.",
+        "message": "Request quantities approved. The Store Manager must issue stock separately.",
         "request_id": req.requestid,
         "status": approved_status_name,
     })
 
+
+@api_view(["GET"])
+@permission_classes([IsAuthenticated])
+def pending_issues(request):
+    try:
+        staff = request.user.staff_account.staff
+    except (StaffAccount.DoesNotExist, AttributeError):
+        return Response(
+            {"error": "No staff account is linked to this user."},
+            status=status.HTTP_403_FORBIDDEN,
+        )
+
+    if staff.positionid_id not in ISSUER_POSITION_IDS:
+        return Response(
+            {"error": "Only the Store Manager can issue approved stock."},
+            status=status.HTTP_403_FORBIDDEN,
+        )
+
+    request_statuses = Status.objects.filter(
+        statusname__in=["Approved", "Partially Issued"]
+    )
+    pending = (
+        Request.objects.filter(statusid__in=request_statuses)
+        .select_related("staffid", "storeid", "statusid")
+        .order_by("requestdate", "requestid")
+    )
+    results = []
+    legacy_review = []
+
+    for req in pending:
+        decision = RequestDecision.objects.filter(
+            request_id=req.requestid
+        ).first()
+        lines = list(
+            RequestItem.objects.filter(requestid=req)
+            .select_related("itemid")
+            .order_by("requestitemid")
+        )
+
+        if decision is None:
+            legacy_review.append({
+                "request_id": req.requestid,
+                "requester": f"{req.staffid.othernames} {req.staffid.surname}".strip(),
+                "store_name": req.storeid.storename,
+                "items": [
+                    {
+                        "request_item_id": line.requestitemid,
+                        "item_name": line.itemid.itemname,
+                        "quantity_requested": line.qtyrequested,
+                        "legacy_quantity_recorded": line.qtyissued,
+                    }
+                    for line in lines
+                ],
+                "message": (
+                    "This request was approved before separate approval "
+                    "and issue tracking. Verify its physical issue history "
+                    "before changing stock."
+                ),
+            })
+            continue
+
+        item_summaries = []
+        for line in lines:
+            approval = RequestApprovalItem.objects.filter(
+                request_item_id=line.requestitemid
+            ).first()
+            if approval is None:
+                continue
+            issued = RequestIssue.objects.filter(
+                request_item_id=line.requestitemid
+            ).aggregate(total=Sum("quantity"))["total"] or 0
+            remaining = max(0, approval.quantity_approved - issued)
+            if remaining:
+                item_summaries.append({
+                    **request_item_summary(line),
+                    "quantity_in_stock": line.itemid.quantity,
+                })
+
+        if item_summaries:
+            results.append({
+                "request_id": req.requestid,
+                "request_date": req.requestdate,
+                "requester": f"{req.staffid.othernames} {req.staffid.surname}".strip(),
+                "store_name": req.storeid.storename,
+                "status": req.statusid.statusname,
+                "items": item_summaries,
+            })
+
+    return Response({
+        "requests": results,
+        "legacy_review": legacy_review,
+    })
+
+
+@api_view(["POST"])
+@permission_classes([IsAuthenticated])
+def reconcile_legacy_request(request, request_id):
+    try:
+        staff = request.user.staff_account.staff
+    except (StaffAccount.DoesNotExist, AttributeError):
+        return Response(
+            {"error": "No staff account is linked to this user."},
+            status=status.HTTP_403_FORBIDDEN,
+        )
+    if staff.positionid_id not in ISSUER_POSITION_IDS:
+        return Response(
+            {"error": "Only the Store Manager can reconcile legacy issue records."},
+            status=status.HTTP_403_FORBIDDEN,
+        )
+    reason = request.data.get("reason")
+    raw_items = request.data.get("items")
+    if not isinstance(reason, str) or not reason.strip():
+        return Response(
+            {"error": "Record how the previous issue history was verified."},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+    if not isinstance(raw_items, list) or not raw_items:
+        return Response(
+            {"error": "Provide the verified approved and previously issued quantities for every item."},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+
+    submitted = {}
+    for entry in raw_items:
+        if not isinstance(entry, dict):
+            return Response(
+                {"error": "Each legacy item entry must be an object."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        line_id = entry.get("request_item_id")
+        approved = entry.get("quantity_approved")
+        previously_issued = entry.get("quantity_previously_issued")
+        if (
+            isinstance(line_id, bool) or not isinstance(line_id, int)
+            or isinstance(approved, bool) or not isinstance(approved, int)
+            or isinstance(previously_issued, bool)
+            or not isinstance(previously_issued, int)
+            or approved < 0 or previously_issued < 0
+        ):
+            return Response(
+                {"error": "Verified quantities must be non-negative whole numbers."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        if line_id in submitted:
+            return Response(
+                {"error": "A request item can appear only once."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        submitted[line_id] = (approved, previously_issued)
+
+    with transaction.atomic():
+        try:
+            req = Request.objects.select_for_update().get(requestid=request_id)
+        except Request.DoesNotExist:
+            return Response(
+                {"error": "Request not found."},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+        if req.statusid.statusname.lower() not in {
+            "approved", "partially issued", "issued"
+        } or RequestDecision.objects.filter(request_id=req.requestid).exists():
+            return Response(
+                {"error": "This request is not an unresolved legacy approval."},
+                status=status.HTTP_409_CONFLICT,
+            )
+        lines = list(
+            RequestItem.objects.select_for_update()
+            .filter(requestid=req)
+            .order_by("requestitemid")
+        )
+        if set(submitted) != {line.requestitemid for line in lines}:
+            return Response(
+                {"error": "Submit verified quantities for every item in the request."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        for line in lines:
+            approved, previously_issued = submitted[line.requestitemid]
+            if approved > line.qtyrequested or previously_issued > approved:
+                return Response(
+                    {"error": f"Verified quantities for item {line.itemid_id} exceed the request or approved amount."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+        is_complete = all(
+            submitted[line.requestitemid][1] == submitted[line.requestitemid][0]
+            for line in lines
+        )
+        has_issue = any(
+            submitted[line.requestitemid][1] > 0
+            for line in lines
+        )
+        next_status_name = (
+            "Issued" if is_complete
+            else "Partially Issued" if has_issue
+            else "Approved"
+        )
+        next_status = Status.objects.filter(
+            statusname__iexact=next_status_name
+        ).first()
+        if next_status is None:
+            return Response(
+                {"error": f"{next_status_name} status is not configured."},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
+
+        RequestDecision.objects.create(
+            request_id=req.requestid,
+            decision="APPROVED",
+            reason=f"Legacy issue history verified: {reason.strip()}",
+            decided_by_staff_id=staff.staffid,
+        )
+        for line in lines:
+            approved, previously_issued = submitted[line.requestitemid]
+            RequestApprovalItem.objects.create(
+                request_item_id=line.requestitemid,
+                quantity_approved=approved,
+            )
+            RequestLegacyReview.objects.create(
+                request_item_id=line.requestitemid,
+                quantity_previously_issued=previously_issued,
+                reviewed_by_staff_id=staff.staffid,
+                reason=reason.strip(),
+            )
+            line.qtyissued = previously_issued
+            line.save(update_fields=["qtyissued"])
+
+        req.statusid = next_status
+        req.save(update_fields=["statusid"])
+
+    return Response({
+        "message": "Legacy quantities were recorded for review; current stock was not changed.",
+        "request_id": req.requestid,
+        "status": req.statusid.statusname,
+    })
+
+
+@api_view(["POST"])
+@permission_classes([IsAuthenticated])
+def issue_request(request, request_id):
+    try:
+        staff = request.user.staff_account.staff
+    except (StaffAccount.DoesNotExist, AttributeError):
+        return Response(
+            {"error": "No staff account is linked to this user."},
+            status=status.HTTP_403_FORBIDDEN,
+        )
+
+    if staff.positionid_id not in ISSUER_POSITION_IDS:
+        return Response(
+            {"error": "Only the Store Manager can issue approved stock."},
+            status=status.HTTP_403_FORBIDDEN,
+        )
+
+    raw_items = request.data.get("items")
+    comments = request.data.get("comments", "")
+    if not isinstance(raw_items, list) or not raw_items:
+        return Response(
+            {"error": "Enter a quantity to issue for at least one approved item."},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+    if not isinstance(comments, str) or len(comments) > 500:
+        return Response(
+            {"error": "Issue notes must be text of at most 500 characters."},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+
+    submitted = {}
+    for entry in raw_items:
+        if not isinstance(entry, dict):
+            return Response(
+                {"error": "Each issue line must be an object."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        line_id = entry.get("request_item_id")
+        quantity = entry.get("quantity")
+        if (
+            isinstance(line_id, bool)
+            or not isinstance(line_id, int)
+            or isinstance(quantity, bool)
+            or not isinstance(quantity, int)
+            or quantity <= 0
+        ):
+            return Response(
+                {"error": "Each issue line needs an item ID and positive whole-number quantity."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        if line_id in submitted:
+            return Response(
+                {"error": "An item can appear only once in an issue."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        submitted[line_id] = quantity
+
+    with transaction.atomic():
+        try:
+            req = (
+                Request.objects.select_for_update()
+                .select_related("statusid")
+                .get(requestid=request_id)
+            )
+        except Request.DoesNotExist:
+            return Response(
+                {"error": "Request not found."},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+
+        decision = RequestDecision.objects.filter(
+            request_id=req.requestid,
+            decision="APPROVED",
+        ).first()
+        if decision is None:
+            return Response(
+                {"error": "This request has no verified approval. Review legacy requests before issuing."},
+                status=status.HTTP_409_CONFLICT,
+            )
+
+        lines = list(
+            RequestItem.objects.select_for_update()
+            .filter(requestid=req)
+            .select_related("itemid")
+            .order_by("requestitemid")
+        )
+        line_by_id = {line.requestitemid: line for line in lines}
+        if not set(submitted).issubset(line_by_id):
+            return Response(
+                {"error": "One or more items do not belong to this request."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        issue_rows = []
+        for line_id, quantity in submitted.items():
+            line = line_by_id[line_id]
+            approval = RequestApprovalItem.objects.filter(
+                request_item_id=line_id
+            ).first()
+            if approval is None:
+                return Response(
+                    {"error": "An item in this request has no approved quantity."},
+                    status=status.HTTP_409_CONFLICT,
+                )
+            issued_before = RequestIssue.objects.filter(
+                request_item_id=line_id
+            ).aggregate(total=Sum("quantity"))["total"] or 0
+            legacy_review = RequestLegacyReview.objects.filter(
+                request_item_id=line_id
+            ).first()
+            if legacy_review:
+                issued_before += legacy_review.quantity_previously_issued
+            remaining = approval.quantity_approved - issued_before
+            if quantity > remaining:
+                return Response(
+                    {"error": f"Issue quantity for {line.itemid.itemname} exceeds its approved remaining quantity ({remaining})."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+            item = Item.objects.select_for_update().get(itemid=line.itemid_id)
+            if quantity > item.quantity:
+                return Response(
+                    {"error": f"Only {item.quantity} {line.itemid.itemname} are currently in stock; issue a smaller quantity."},
+                    status=status.HTTP_409_CONFLICT,
+                )
+            issue_rows.append((line, item, quantity, issued_before))
+
+        for line, item, quantity, issued_before in issue_rows:
+            new_stock = item.quantity - quantity
+            item.quantity = new_stock
+            item.save(update_fields=["quantity"])
+            RequestIssue.objects.create(
+                request_item_id=line.requestitemid,
+                item_id=item.itemid,
+                quantity=quantity,
+                issued_by_staff_id=staff.staffid,
+                comments=comments.strip(),
+            )
+            line.qtyissued = issued_before + quantity
+            line.save(update_fields=["qtyissued"])
+            InventoryAudit.objects.create(
+                item_id=item.itemid,
+                item_name=item.itemname,
+                action="ISSUE",
+                field_changed="quantity",
+                old_value=str(new_stock + quantity),
+                new_value=str(new_stock),
+                comments=(
+                    f"Request {req.requestid}; issued to "
+                    f"{req.staffid.othernames} {req.staffid.surname}. "
+                    f"{comments.strip()}"
+                ).strip(),
+                changed_by=request.user,
+            )
+
+        all_approved = list(
+            RequestApprovalItem.objects.filter(
+                request_item_id__in=line_by_id
+            ).values_list("request_item_id", "quantity_approved")
+        )
+        all_complete = bool(all_approved) and all(
+            (RequestIssue.objects.filter(request_item_id=line_id)
+             .aggregate(total=Sum("quantity"))["total"] or 0)
+            + (
+                RequestLegacyReview.objects.filter(
+                    request_item_id=line_id
+                ).values_list("quantity_previously_issued", flat=True).first()
+                or 0
+            ) >= approved
+            for line_id, approved in all_approved
+        )
+        next_status_name = "Issued" if all_complete else "Partially Issued"
+        next_status = Status.objects.filter(
+            statusname__iexact=next_status_name
+        ).first()
+        if next_status is None:
+            return Response(
+                {"error": f"{next_status_name} status is not configured."},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
+        req.statusid = next_status
+        req.save(update_fields=["statusid"])
+
+    return Response({
+        "message": "Stock issued and inventory updated.",
+        "request_id": req.requestid,
+        "status": next_status_name,
+    })
 
 
 @api_view(["POST"])
@@ -933,10 +1588,17 @@ def reject_request(request, request_id):
             status=status.HTTP_403_FORBIDDEN,
         )
 
-    if staff.positionid_id not in [5, 6, 7]:
+    if staff.positionid_id not in APPROVER_POSITION_IDS:
         return Response(
             {"error": "You are not authorized to reject requests."},
             status=status.HTTP_403_FORBIDDEN,
+        )
+
+    reason = request.data.get("reason")
+    if not isinstance(reason, str) or not reason.strip():
+        return Response(
+            {"error": "A reason is required when rejecting a request."},
+            status=status.HTTP_400_BAD_REQUEST,
         )
 
     with transaction.atomic():
@@ -956,6 +1618,12 @@ def reject_request(request, request_id):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
+        if RequestDecision.objects.filter(request_id=req.requestid).exists():
+            return Response(
+                {"error": "This request already has a recorded decision."},
+                status=status.HTTP_409_CONFLICT,
+            )
+
         rejected_status = Status.objects.filter(
             statusname__iexact="Rejected"
         ).first()
@@ -969,12 +1637,338 @@ def reject_request(request, request_id):
         req.statusid = rejected_status
         req.approvedby = staff
         req.save(update_fields=["statusid", "approvedby"])
+        RequestDecision.objects.create(
+            request_id=req.requestid,
+            decision="REJECTED",
+            reason=reason.strip(),
+            decided_by_staff_id=staff.staffid,
+        )
 
     return Response({
         "message": "Request rejected successfully.",
         "request_id": req.requestid,
         "status": "Rejected",
     })
+
+
+def purchase_order_summary(order):
+    supplier = Supplier.objects.filter(
+        supplierid=order.supplier_id
+    ).first()
+    store = Store.objects.filter(storeid=order.store_id).first()
+    lines = []
+    for line in order.lines.order_by("pk"):
+        item = Item.objects.filter(itemid=line.item_id).first()
+        lines.append({
+            "line_id": line.pk,
+            "item_id": line.item_id,
+            "item_name": item.itemname if item else "Unknown item",
+            "quantity_ordered": line.quantity_ordered,
+            "quantity_received": line.quantity_received,
+            "quantity_remaining": max(
+                0, line.quantity_ordered - line.quantity_received
+            ),
+            "unit_cost": str(line.unit_cost),
+        })
+    return {
+        "purchase_order_id": order.pk,
+        "order_number": order.order_number,
+        "store_id": order.store_id,
+        "store_name": store.storename if store else "Unknown store",
+        "supplier_id": order.supplier_id,
+        "supplier_name": supplier.suppliername if supplier else "Unknown supplier",
+        "status": order.status,
+        "order_date": order.order_date,
+        "expected_date": order.expected_date,
+        "notes": order.notes,
+        "rejection_reason": order.rejection_reason,
+        "lines": lines,
+    }
+
+
+def pending_issue_updates(item_ids):
+    if not item_ids:
+        return []
+    updated = []
+    lines = (
+        RequestItem.objects.filter(itemid_id__in=item_ids)
+        .select_related("requestid", "requestid__staffid", "itemid", "requestid__statusid")
+        .order_by("requestid__requestdate", "requestid_id", "requestitemid")
+    )
+    for line in lines:
+        decision = RequestDecision.objects.filter(
+            request_id=line.requestid_id,
+            decision="APPROVED",
+        ).first()
+        if decision is None:
+            continue
+        approval = RequestApprovalItem.objects.filter(
+            request_item_id=line.requestitemid
+        ).first()
+        if approval is None:
+            continue
+        issued = RequestIssue.objects.filter(
+            request_item_id=line.requestitemid
+        ).aggregate(total=Sum("quantity"))["total"] or 0
+        remaining = max(0, approval.quantity_approved - issued)
+        if remaining:
+            updated.append({
+                "request_id": line.requestid_id,
+                "requester": (
+                    f"{line.requestid.staffid.othernames} "
+                    f"{line.requestid.staffid.surname}"
+                ).strip(),
+                "item_name": line.itemid.itemname,
+                "quantity_remaining": remaining,
+                "quantity_in_stock": line.itemid.quantity,
+            })
+    return updated
+
+
+@api_view(["GET", "POST"])
+@permission_classes([IsAuthenticated])
+def purchase_orders(request):
+    try:
+        staff = request.user.staff_account.staff
+    except (StaffAccount.DoesNotExist, AttributeError):
+        return Response(
+            {"error": "No staff account is linked to this user."},
+            status=status.HTTP_403_FORBIDDEN,
+        )
+
+    if request.method == "GET":
+        if staff.positionid_id not in (*PURCHASING_POSITION_IDS, *PURCHASE_ORDER_APPROVER_POSITION_IDS):
+            return Response(
+                {"error": "You are not authorized to view purchase orders."},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+        orders = PurchaseOrder.objects.all()
+        if staff.positionid_id in PURCHASING_POSITION_IDS:
+            orders = orders.filter(created_by_staff_id=staff.staffid)
+        return Response({
+            "purchase_orders": [
+                purchase_order_summary(order)
+                for order in orders.order_by("-created_at")
+            ],
+        })
+
+    if staff.positionid_id not in PURCHASING_POSITION_IDS:
+        return Response(
+            {"error": "Only the Store Manager or Procurement Officer can create purchase orders."},
+            status=status.HTTP_403_FORBIDDEN,
+        )
+
+    data = request.data
+    order_number = data.get("order_number")
+    store_id = data.get("store_id")
+    supplier_id = data.get("supplier_id")
+    order_date = data.get("order_date")
+    expected_date = data.get("expected_date") or None
+    notes = data.get("notes", "")
+    raw_lines = data.get("items")
+
+    if not isinstance(order_number, str) or not order_number.strip() or len(order_number.strip()) > 30:
+        return Response(
+            {"error": "Enter a unique purchase order number of at most 30 characters."},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+    if PurchaseOrder.objects.filter(order_number=order_number.strip()).exists():
+        return Response(
+            {"error": "That purchase order number already exists."},
+            status=status.HTTP_409_CONFLICT,
+        )
+    if (
+        isinstance(store_id, bool) or not isinstance(store_id, int)
+        or isinstance(supplier_id, bool) or not isinstance(supplier_id, int)
+    ):
+        return Response(
+            {"error": "Select a valid store and supplier."},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+    if not isinstance(notes, str) or len(notes) > 1000:
+        return Response(
+            {"error": "Purchase order notes must be text of at most 1000 characters."},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+    try:
+        parsed_order_date = date.fromisoformat(order_date)
+        parsed_expected_date = (
+            date.fromisoformat(expected_date) if expected_date else None
+        )
+        store = Store.objects.get(storeid=store_id)
+        supplier = Supplier.objects.get(supplierid=supplier_id)
+    except (ValueError, TypeError, Store.DoesNotExist, Supplier.DoesNotExist):
+        return Response(
+            {"error": "Enter valid order dates and select an existing store and supplier."},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+    if parsed_expected_date and parsed_expected_date < parsed_order_date:
+        return Response(
+            {"error": "Expected delivery cannot be before the order date."},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+    if not isinstance(raw_lines, list) or not raw_lines:
+        return Response(
+            {"error": "Add at least one item to the purchase order."},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+
+    archived_ids = archived_item_ids()
+    seen_items = set()
+    validated_lines = []
+    for entry in raw_lines:
+        if not isinstance(entry, dict):
+            return Response(
+                {"error": "Each purchase order item must be an object."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        item_id = entry.get("item_id")
+        quantity = entry.get("quantity")
+        try:
+            unit_cost = Decimal(str(entry.get("unit_cost")))
+        except (InvalidOperation, TypeError, ValueError):
+            return Response(
+                {"error": "Each item needs a valid unit cost."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        if (
+            isinstance(item_id, bool) or not isinstance(item_id, int)
+            or isinstance(quantity, bool) or not isinstance(quantity, int)
+            or quantity <= 0 or item_id in seen_items
+            or not unit_cost.is_finite() or unit_cost < 0
+            or unit_cost.as_tuple().exponent < -2
+        ):
+            return Response(
+                {"error": "Each item needs a unique item ID, positive whole-number quantity and non-negative unit cost with at most two decimals."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        if item_id in archived_ids:
+            return Response(
+                {"error": "Archived items cannot be ordered."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        item = Item.objects.filter(itemid=item_id).first()
+        if item is None or item.storeid_id != store.storeid:
+            return Response(
+                {"error": "Every ordered item must belong to the selected store."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        seen_items.add(item_id)
+        validated_lines.append((item_id, quantity, unit_cost))
+
+    with transaction.atomic():
+        order = PurchaseOrder.objects.create(
+            order_number=order_number.strip(),
+            store_id=store.storeid,
+            supplier_id=supplier.supplierid,
+            created_by_staff_id=staff.staffid,
+            status=PurchaseOrder.STATUS_PENDING,
+            order_date=parsed_order_date,
+            expected_date=parsed_expected_date,
+            notes=notes.strip(),
+        )
+        PurchaseOrderLine.objects.bulk_create([
+            PurchaseOrderLine(
+                purchase_order=order,
+                item_id=item_id,
+                quantity_ordered=quantity,
+                unit_cost=unit_cost,
+            )
+            for item_id, quantity, unit_cost in validated_lines
+        ])
+
+    return Response({
+        "message": "Purchase order submitted for approval.",
+        "purchase_order": purchase_order_summary(order),
+    }, status=status.HTTP_201_CREATED)
+
+
+@api_view(["GET"])
+@permission_classes([IsAuthenticated])
+def pending_purchase_orders(request):
+    try:
+        staff = request.user.staff_account.staff
+    except (StaffAccount.DoesNotExist, AttributeError):
+        return Response(
+            {"error": "No staff account is linked to this user."},
+            status=status.HTTP_403_FORBIDDEN,
+        )
+    if staff.positionid_id not in PURCHASE_ORDER_APPROVER_POSITION_IDS:
+        return Response(
+            {"error": "You are not authorized to approve purchase orders."},
+            status=status.HTTP_403_FORBIDDEN,
+        )
+    return Response({
+        "purchase_orders": [
+            purchase_order_summary(order)
+            for order in PurchaseOrder.objects.filter(
+                status=PurchaseOrder.STATUS_PENDING
+            ).order_by("created_at")
+        ],
+    })
+
+
+@api_view(["POST"])
+@permission_classes([IsAuthenticated])
+def decide_purchase_order(request, order_id):
+    try:
+        staff = request.user.staff_account.staff
+    except (StaffAccount.DoesNotExist, AttributeError):
+        return Response(
+            {"error": "No staff account is linked to this user."},
+            status=status.HTTP_403_FORBIDDEN,
+        )
+    if staff.positionid_id not in PURCHASE_ORDER_APPROVER_POSITION_IDS:
+        return Response(
+            {"error": "Only the Principal or Deputy Principal can decide purchase orders."},
+            status=status.HTTP_403_FORBIDDEN,
+        )
+    decision = request.data.get("decision")
+    reason = request.data.get("reason", "")
+    if decision not in {"APPROVED", "REJECTED"}:
+        return Response(
+            {"error": "Choose APPROVED or REJECTED."},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+    if not isinstance(reason, str) or (
+        decision == "REJECTED" and not reason.strip()
+    ):
+        return Response(
+            {"error": "A reason is required when rejecting a purchase order."},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+    with transaction.atomic():
+        try:
+            order = PurchaseOrder.objects.select_for_update().get(pk=order_id)
+        except PurchaseOrder.DoesNotExist:
+            return Response(
+                {"error": "Purchase order not found."},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+        if order.status != PurchaseOrder.STATUS_PENDING:
+            return Response(
+                {"error": "Only pending purchase orders can be decided."},
+                status=status.HTTP_409_CONFLICT,
+            )
+        order.approved_by_staff_id = staff.staffid
+        order.status = (
+            PurchaseOrder.STATUS_APPROVED
+            if decision == "APPROVED"
+            else PurchaseOrder.STATUS_REJECTED
+        )
+        order.rejection_reason = (
+            reason.strip() if decision == "REJECTED" else ""
+        )
+        order.save(update_fields=[
+            "approved_by_staff_id", "status", "rejection_reason"
+        ])
+    return Response({
+        "message": f"Purchase order {order.status.lower()}.",
+        "purchase_order_id": order.pk,
+        "status": order.status,
+    })
+
+
 @api_view(["GET"])
 @permission_classes([IsAuthenticated])
 def receiving_options(request):
@@ -987,7 +1981,7 @@ def receiving_options(request):
             status=status.HTTP_403_FORBIDDEN,
         )
 
-    if staff.positionid_id != 7:
+    if staff.positionid_id not in ISSUER_POSITION_IDS:
         return Response(
             {"error": "Only the Store Manager can access goods receiving."},
             status=status.HTTP_403_FORBIDDEN,
@@ -1005,6 +1999,7 @@ def receiving_options(request):
         )
     )
 
+    archived_ids = archived_item_ids()
     items = [
         {
             "item_id": item.itemid,
@@ -1014,15 +2009,25 @@ def receiving_options(request):
             "quantity_in_stock": item.quantity,
             "unit_id": item.unitid_id,
         }
-        for item in Item.objects.select_related(
+        for item in Item.objects.exclude(itemid__in=archived_ids).select_related(
             "storeid", "unitid"
         ).order_by("itemname")
+    ]
+    open_orders = [
+        purchase_order_summary(order)
+        for order in PurchaseOrder.objects.filter(
+            status__in=[
+                PurchaseOrder.STATUS_APPROVED,
+                PurchaseOrder.STATUS_PARTIALLY_RECEIVED,
+            ]
+        ).order_by("order_date", "pk")
     ]
 
     return Response({
         "stores": stores,
         "suppliers": suppliers,
         "items": items,
+        "purchase_orders": open_orders,
     })
 
 
@@ -1038,7 +2043,7 @@ def receive_goods(request):
             status=status.HTTP_403_FORBIDDEN,
         )
 
-    if staff.positionid_id != 7:
+    if staff.positionid_id not in ISSUER_POSITION_IDS:
         return Response(
             {"error": "Only the Store Manager can receive goods."},
             status=status.HTTP_403_FORBIDDEN,
@@ -1046,12 +2051,22 @@ def receive_goods(request):
 
     data = request.data
 
+    purchase_order_id = data.get("purchase_order_id")
     store_id = data.get("store_id")
     supplier_id = data.get("supplier_id")
     invoice_number = data.get("invoice_number")
     grn_number = data.get("grn_number")
     remarks = data.get("remarks", "")
     raw_items = data.get("items")
+
+    if (
+        isinstance(purchase_order_id, bool)
+        or not isinstance(purchase_order_id, int)
+    ):
+        return Response(
+            {"error": "Select an approved purchase order."},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
 
     if isinstance(store_id, bool) or not isinstance(store_id, int):
         return Response(
@@ -1141,9 +2156,30 @@ def receive_goods(request):
     try:
         store = Store.objects.get(storeid=store_id)
         supplier = Supplier.objects.get(supplierid=supplier_id)
+        purchase_order = PurchaseOrder.objects.get(
+            pk=purchase_order_id,
+            status__in=[
+                PurchaseOrder.STATUS_APPROVED,
+                PurchaseOrder.STATUS_PARTIALLY_RECEIVED,
+            ],
+        )
     except (Store.DoesNotExist, Supplier.DoesNotExist):
         return Response(
             {"error": "The selected store or supplier does not exist."},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+    except PurchaseOrder.DoesNotExist:
+        return Response(
+            {"error": "Select an approved purchase order with goods still outstanding."},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+
+    if (
+        purchase_order.store_id != store.storeid
+        or purchase_order.supplier_id != supplier.supplierid
+    ):
+        return Response(
+            {"error": "Store and supplier must match the selected purchase order."},
             status=status.HTTP_400_BAD_REQUEST,
         )
 
@@ -1228,6 +2264,19 @@ def receive_goods(request):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
+        order_line = PurchaseOrderLine.objects.filter(
+            purchase_order=purchase_order,
+            item_id=item_id,
+        ).first()
+        if (
+            order_line is None
+            or order_line.quantity_ordered - order_line.quantity_received < quantity
+        ):
+            return Response(
+                {"error": f"{item.itemname} quantity exceeds the amount remaining on the purchase order."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
         subtotal = (unit_cost * quantity).quantize(Decimal("0.01"))
         total_amount += subtotal
 
@@ -1258,6 +2307,35 @@ def receive_goods(request):
                     {"error": "That GRN number has already been recorded."},
                     status=status.HTTP_400_BAD_REQUEST,
                 )
+
+            locked_order = PurchaseOrder.objects.select_for_update().get(
+                pk=purchase_order.pk
+            )
+            if locked_order.status not in {
+                PurchaseOrder.STATUS_APPROVED,
+                PurchaseOrder.STATUS_PARTIALLY_RECEIVED,
+            }:
+                return Response(
+                    {"error": "This purchase order is no longer open for receiving."},
+                    status=status.HTTP_409_CONFLICT,
+                )
+            locked_order_lines = {
+                line.item_id: line
+                for line in PurchaseOrderLine.objects.select_for_update().filter(
+                    purchase_order=locked_order
+                )
+            }
+            for entry in validated_items:
+                order_line = locked_order_lines.get(entry["item_id"])
+                if (
+                    order_line is None
+                    or order_line.quantity_ordered - order_line.quantity_received
+                    < entry["quantity"]
+                ):
+                    return Response(
+                        {"error": "The requested delivery quantity exceeds the remaining purchase order quantity. Refresh and try again."},
+                        status=status.HTTP_409_CONFLICT,
+                    )
 
             purchase = Purchase.objects.create(
                 storeid=store,
@@ -1290,6 +2368,26 @@ def receive_goods(request):
                 staffid=staff,
                 remarks=remarks.strip(),
             )
+            PurchaseOrderReceipt.objects.create(
+                purchase_order=locked_order,
+                purchase_id=purchase.purchaseid,
+            )
+
+            for entry in validated_items:
+                order_line = locked_order_lines[entry["item_id"]]
+                order_line.quantity_received += entry["quantity"]
+                order_line.save(update_fields=["quantity_received"])
+
+            all_order_lines = list(
+                PurchaseOrderLine.objects.filter(
+                    purchase_order=locked_order
+                ).values_list("quantity_ordered", "quantity_received")
+            )
+            if all(received >= ordered for ordered, received in all_order_lines):
+                locked_order.status = PurchaseOrder.STATUS_RECEIVED
+            else:
+                locked_order.status = PurchaseOrder.STATUS_PARTIALLY_RECEIVED
+            locked_order.save(update_fields=["status"])
 
             # Lock each stock row and audit every stock increase.
             for entry in validated_items:
@@ -1338,6 +2436,10 @@ def receive_goods(request):
             "invoice_number": purchase.invoicenumber,
             "total_amount": str(purchase.totalamount),
             "items_received": len(validated_items),
+            "purchase_order_status": locked_order.status,
+            "pending_issue_updates": pending_issue_updates(
+                {entry["item_id"] for entry in validated_items}
+            ),
         },
         status=status.HTTP_201_CREATED,
     )
@@ -1357,7 +2459,7 @@ def reports_dashboard(request):
     position_id = staff.positionid_id
 
     # Management reports are restricted to authorized positions.
-    if position_id not in [5, 6, 7, 8]:
+    if position_id not in INVENTORY_VIEW_POSITION_IDS:
         return Response(
             {"error": "You are not authorized to view management reports."},
             status=status.HTTP_403_FORBIDDEN,
@@ -1460,9 +2562,9 @@ def reports_dashboard(request):
             "new_quantity": new_quantity,
             "quantity_change": difference,
             "movement_type": (
-                "IN" if difference > 0
-                else "OUT" if difference < 0
-                else "NO CHANGE"
+                "RECEIVED" if audit.action == "RECEIVE"
+                else "ISSUED" if audit.action == "ISSUE"
+                else "ADJUSTMENT"
             ),
             "changed_at": audit.changed_at.isoformat(),
             "comments": audit.comments,
@@ -1477,7 +2579,23 @@ def reports_dashboard(request):
 
     request_totals = RequestItem.objects.aggregate(
         total_requested=Sum("qtyrequested"),
-        total_issued=Sum("qtyissued"),
+    )
+    request_totals["total_approved"] = (
+        RequestApprovalItem.objects.aggregate(
+            total=Sum("quantity_approved")
+        )["total"] or 0
+    )
+    request_totals["total_issued"] = (
+        RequestIssue.objects.aggregate(total=Sum("quantity"))["total"] or 0
+    )
+    request_totals["legacy_requests_needing_review"] = (
+        Request.objects.filter(
+            statusid__statusname__in=[
+                "Approved", "Partially Issued", "Issued"
+            ]
+        ).exclude(
+            requestid__in=RequestDecision.objects.values("request_id")
+        ).count()
     )
 
     monthly_purchases = list(
@@ -1570,7 +2688,7 @@ def reports_dashboard(request):
 from django.db import IntegrityError
 
 
-MANAGEMENT_POSITIONS = [5, 7, 8]
+MANAGEMENT_POSITIONS = MANAGEMENT_POSITION_IDS
 # 5 = Principal, 7 = Store Manager, 8 = Procurement Officer
 
 
@@ -1600,6 +2718,14 @@ def staff_management(request):
         staff_members = Staff.objects.select_related(
             "departmentid", "positionid"
         ).order_by("staffid")
+        account_by_staff = {
+            account.staff_id: account.user.is_active
+            and account.user.has_usable_password()
+            for account in StaffAccount.objects.select_related("user")
+        }
+        email_by_staff = dict(
+            StaffContact.objects.values_list("staff_id", "email")
+        )
 
         departments = Department.objects.order_by(
             "departmentid"
@@ -1620,6 +2746,8 @@ def staff_management(request):
                     "position_id": person.positionid_id,
                     "position": person.positionid.positionname,
                     "contact": person.contact,
+                    "email": email_by_staff.get(person.staffid, ""),
+                    "login_ready": account_by_staff.get(person.staffid, False),
                 }
                 for person in staff_members
             ],
@@ -1631,6 +2759,7 @@ def staff_management(request):
     surname = data.get("surname")
     othernames = data.get("othernames")
     contact = data.get("contact")
+    email = data.get("email")
     department_id = data.get("department_id")
     position_id = data.get("position_id")
 
@@ -1657,6 +2786,19 @@ def staff_management(request):
             status=status.HTTP_400_BAD_REQUEST,
         )
 
+    if not isinstance(email, str) or not email.strip():
+        return Response(
+        {"error": "A staff email address is required to send the account setup link."},
+        status=status.HTTP_400_BAD_REQUEST,
+        )
+    try:
+        validate_email(email.strip())
+    except ValidationError:
+        return Response(
+        {"error": "Enter a valid staff email address."},
+        status=status.HTTP_400_BAD_REQUEST,
+        )
+
     try:
         department = Department.objects.get(departmentid=department_id)
         position = Position.objects.get(positionid=position_id)
@@ -1667,26 +2809,77 @@ def staff_management(request):
         )
 
     try:
-        person = Staff.objects.create(
-            surname=surname.strip(),
-            othernames=othernames.strip(),
-            contact=contact.strip(),
-            departmentid=department,
-            positionid=position,
+        with transaction.atomic():
+            person = Staff.objects.create(
+                surname=surname.strip(),
+                othernames=othernames.strip(),
+                contact=contact.strip(),
+                departmentid=department,
+                positionid=position,
+            )
+            user = get_user_model().objects.create_user(
+                username=str(person.staffid),
+                password=None,
+                first_name=othernames.strip(),
+                last_name=surname.strip(),
+            )
+            StaffAccount.objects.create(user=user, staff=person)
+            StaffContact.objects.create(
+                staff_id=person.staffid,
+                email=email.strip(),
+            )
+            send_account_setup_email(user, email.strip())
+    except (RuntimeError, OSError, smtplib.SMTPException) as error:
+        return Response(
+            {"error": f"Staff account could not be created because the setup email was not sent: {error}"},
+            status=status.HTTP_503_SERVICE_UNAVAILABLE,
         )
     except IntegrityError:
         return Response(
-            {"error": "The staff member could not be created."},
+            {"error": "The staff member or email already exists."},
             status=status.HTTP_400_BAD_REQUEST,
         )
 
     return Response(
         {
-            "message": "Staff member created successfully.",
+            "message": "Staff member and login created. A password setup link was emailed.",
             "staff_id": person.staffid,
         },
         status=status.HTTP_201_CREATED,
     )
+
+
+@api_view(["POST"])
+@permission_classes([IsAuthenticated])
+def resend_staff_setup_email(request, staff_id):
+    if get_management_staff(request) is None:
+        return Response(
+            {"error": "You are not authorized to manage staff accounts."},
+            status=status.HTTP_403_FORBIDDEN,
+        )
+    try:
+        account = StaffAccount.objects.select_related("user", "staff").get(
+            staff_id=staff_id
+        )
+        contact = StaffContact.objects.get(staff_id=staff_id)
+    except (StaffAccount.DoesNotExist, StaffContact.DoesNotExist):
+        return Response(
+            {"error": "No invited login account was found for this staff member."},
+            status=status.HTTP_404_NOT_FOUND,
+        )
+    if account.user.has_usable_password():
+        return Response(
+            {"error": "This staff member has already set a password."},
+            status=status.HTTP_409_CONFLICT,
+        )
+    try:
+        send_account_setup_email(account.user, contact.email)
+    except (RuntimeError, OSError, smtplib.SMTPException) as error:
+        return Response(
+            {"error": f"The setup email could not be sent: {error}"},
+            status=status.HTTP_503_SERVICE_UNAVAILABLE,
+        )
+    return Response({"message": f"A new setup link was sent to {contact.email}."})
 
 
 @api_view(["GET", "POST"])
@@ -1699,6 +2892,7 @@ def item_management(request):
         )
 
     if request.method == "GET":
+        archived_ids = archived_item_ids()
         items = Item.objects.select_related(
             "storeid", "unitid"
         ).order_by("itemid")
@@ -1714,6 +2908,7 @@ def item_management(request):
                     "unit_name": item.unitid.unitname,
                     "quantity": item.quantity,
                     "reorder_level": item.reorderlevel,
+                    "is_archived": item.itemid in archived_ids,
                 }
                 for item in items
             ],
@@ -1911,7 +3106,7 @@ def supplier_management(request):
 def delete_inventory_item(request, item_id):
     staff = get_management_staff(request)
 
-    if staff is None or staff.positionid_id not in [5, 7]:
+    if staff is None or staff.positionid_id not in INVENTORY_MAINTAINER_POSITION_IDS:
         return Response(
             {"error": "Only the Principal or Store Manager can delete inventory items."},
             status=status.HTTP_403_FORBIDDEN,
@@ -1946,6 +3141,12 @@ def delete_inventory_item(request, item_id):
             status=status.HTTP_409_CONFLICT,
         )
 
+    if ItemArchive.objects.filter(item_id=item_id).exists():
+        return Response(
+            {"error": "This item cannot be deleted because it has archive history."},
+            status=status.HTTP_409_CONFLICT,
+        )
+
     if item.quantity != 0:
         return Response(
             {"error": "Only items with zero stock can be deleted."},
@@ -1958,3 +3159,83 @@ def delete_inventory_item(request, item_id):
         {"message": "Inventory item deleted successfully."},
         status=status.HTTP_200_OK,
     )
+
+
+@api_view(["POST"])
+@permission_classes([IsAuthenticated])
+def set_item_archive_state(request, item_id):
+    staff = get_management_staff(request)
+    if staff is None or staff.positionid_id not in INVENTORY_MAINTAINER_POSITION_IDS:
+        return Response(
+            {"error": "Only the Principal or Store Manager can archive items."},
+            status=status.HTTP_403_FORBIDDEN,
+        )
+
+    action = request.data.get("action")
+    reason = request.data.get("reason")
+    if action not in {"ARCHIVED", "RESTORED"}:
+        return Response(
+            {"error": "Choose ARCHIVED or RESTORED."},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+    if not isinstance(reason, str) or not reason.strip():
+        return Response(
+            {"error": "A reason is required."},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+
+    try:
+        item = Item.objects.get(itemid=item_id)
+    except Item.DoesNotExist:
+        return Response(
+            {"error": "Inventory item not found."},
+            status=status.HTTP_404_NOT_FOUND,
+        )
+
+    currently_archived = item_id in archived_item_ids()
+    if (action == "ARCHIVED" and currently_archived) or (
+        action == "RESTORED" and not currently_archived
+    ):
+        return Response(
+            {"error": "The item already has the requested archive state."},
+            status=status.HTTP_409_CONFLICT,
+        )
+
+    if action == "ARCHIVED":
+        approved_lines = RequestApprovalItem.objects.filter(
+            request_item_id__in=RequestItem.objects.filter(
+                itemid_id=item_id
+            ).values("requestitemid")
+        )
+        has_pending_issue = False
+        for approval in approved_lines:
+            issued = RequestIssue.objects.filter(
+                request_item_id=approval.request_item_id
+            ).aggregate(total=Sum("quantity"))["total"] or 0
+            legacy = RequestLegacyReview.objects.filter(
+                request_item_id=approval.request_item_id
+            ).values_list("quantity_previously_issued", flat=True).first() or 0
+            if issued + legacy < approval.quantity_approved:
+                has_pending_issue = True
+                break
+        if has_pending_issue:
+            return Response(
+                {"error": "This item has approved quantities awaiting issue. Complete or resolve them before archiving."},
+                status=status.HTTP_409_CONFLICT,
+            )
+
+    ItemArchive.objects.create(
+        item_id=item.itemid,
+        action=action,
+        archived_by_staff_id=staff.staffid,
+        reason=reason.strip(),
+    )
+    return Response({
+        "message": (
+            "Item archived. It is hidden from new requests and receiving."
+            if action == "ARCHIVED"
+            else "Item restored and available for requests and receiving."
+        ),
+        "item_id": item.itemid,
+        "is_archived": action == "ARCHIVED",
+    })

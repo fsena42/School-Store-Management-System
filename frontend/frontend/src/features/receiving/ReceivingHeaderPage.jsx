@@ -3,6 +3,9 @@ export default function ReceivingHeaderPage({
   onChange,
   stores,
   suppliers,
+  purchaseOrders,
+  selectedOrder,
+  onOrderChange,
 }) {
   return (
     <section className="receiving-panel">
@@ -10,12 +13,30 @@ export default function ReceivingHeaderPage({
 
       <div className="receiving-form-grid">
         <label>
+          Approved purchase order
+          <select
+            name="purchase_order_id"
+            value={form.purchase_order_id}
+            onChange={onOrderChange}
+            required
+          >
+            <option value="">Select an approved order</option>
+            {purchaseOrders.map((order) => (
+              <option key={order.purchase_order_id} value={order.purchase_order_id}>
+                {order.order_number} · {order.store_name} · {order.supplier_name}
+              </option>
+            ))}
+          </select>
+        </label>
+
+        <label>
           Store
           <select
             name="store_id"
             value={form.store_id}
             onChange={onChange}
             required
+            disabled={Boolean(selectedOrder)}
           >
             <option value="">Select store</option>
             {stores.map((store) => (
@@ -33,6 +54,7 @@ export default function ReceivingHeaderPage({
             value={form.supplier_id}
             onChange={onChange}
             required
+            disabled={Boolean(selectedOrder)}
           >
             <option value="">Select supplier</option>
             {suppliers.map((supplier) => (

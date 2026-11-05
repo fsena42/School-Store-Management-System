@@ -3,12 +3,14 @@ import { apiRequest } from '../../api/client'
 import InventoryPage from '../inventory/InventoryPage'
 import RequestsPage from '../requests/RequestPage.jsx'
 import ApprovalsPage from '../approvals/ApprovalsPage'
+import IssuesPage from '../approvals/IssuesPage'
 import ReceivingGoodsPage from '../receiving/ReceivingGoodsPage'
+import PurchaseOrdersPage from '../receiving/PurchaseOrdersPage'
 import ManagementPage from '../management/ManagementPage'
 import ReportsPage from '../reports/ReportsPage'
 import './DashboardPage.css'
 
-function DashboardPage({ onLogout }) {
+function DashboardPage({ onLogout, logoutError }) {
   const [dashboard, setDashboard] = useState(null)
   const [error, setError] = useState('')
   const [loading, setLoading] = useState(true)
@@ -82,7 +84,13 @@ function DashboardPage({ onLogout }) {
     )
   }
 
-  const { staff, stores = [], can_approve } = dashboard
+  const {
+    staff,
+    stores = [],
+    can_approve,
+    can_issue,
+    can_manage_purchase_orders,
+  } = dashboard
 
   const reportPositions = [
     'Principal',
@@ -127,6 +135,10 @@ function DashboardPage({ onLogout }) {
     )
   }
 
+  if (currentPage === 'issues' && can_issue) {
+    return <IssuesPage onBack={() => setCurrentPage('dashboard')} />
+  }
+
   if (
     currentPage === 'receiving' &&
     staff.position === 'Store Manager'
@@ -134,8 +146,13 @@ function DashboardPage({ onLogout }) {
     return (
       <ReceivingGoodsPage
         onBack={() => setCurrentPage('dashboard')}
+        onViewIssues={() => setCurrentPage('issues')}
       />
     )
+  }
+
+  if (currentPage === 'purchase-orders' && can_manage_purchase_orders) {
+    return <PurchaseOrdersPage onBack={() => setCurrentPage('dashboard')} />
   }
 
   if (currentPage === 'reports' && canViewReports) {
@@ -187,6 +204,7 @@ function DashboardPage({ onLogout }) {
           <strong>{staff.position}</strong>
         </div>
       </section>
+      {logoutError && <p className="dashboard-error" role="alert">{logoutError}</p>}
 
       <section className="dashboard-section">
         <h2>Your workspace</h2>
@@ -231,6 +249,32 @@ function DashboardPage({ onLogout }) {
                 onClick={() => setCurrentPage('approvals')}
               >
                 View approvals
+              </button>
+            </article>
+          )}
+
+          {can_issue && (
+            <article className="dashboard-card">
+              <div className="card-icon">↘</div>
+              <h3>Issue approved stock</h3>
+              <p>
+                Record what was physically issued and update available stock.
+              </p>
+              <button onClick={() => setCurrentPage('issues')}>
+                View pending issues
+              </button>
+            </article>
+          )}
+
+          {can_manage_purchase_orders && (
+            <article className="dashboard-card">
+              <div className="card-icon">▣</div>
+              <h3>Purchase orders</h3>
+              <p>
+                Plan purchases, submit them for approval, and track deliveries.
+              </p>
+              <button onClick={() => setCurrentPage('purchase-orders')}>
+                Manage purchase orders
               </button>
             </article>
           )}

@@ -81,8 +81,8 @@ function InventoryReport({ report }) {
 
       const change = Number(movement.quantity_change || 0)
 
-      if (change > 0) daily[day].stockIn += change
-      if (change < 0) daily[day].stockOut += Math.abs(change)
+      if (movement.movement_type === 'RECEIVED') daily[day].stockIn += change
+      if (movement.movement_type === 'ISSUED') daily[day].stockOut += Math.abs(change)
     }
 
     return Object.values(daily).sort((a, b) =>
@@ -92,15 +92,22 @@ function InventoryReport({ report }) {
 
   const totalIn = movements.reduce(
     (sum, movement) =>
-      sum + Math.max(0, Number(movement.quantity_change || 0)),
+      sum + (movement.movement_type === 'RECEIVED'
+        ? Number(movement.quantity_change || 0)
+        : 0),
     0
   )
 
   const totalOut = movements.reduce(
     (sum, movement) =>
-      sum + Math.abs(Math.min(0, Number(movement.quantity_change || 0))),
+      sum + (movement.movement_type === 'ISSUED'
+        ? Math.abs(Number(movement.quantity_change || 0))
+        : 0),
     0
   )
+  const adjustments = movements
+    .filter((movement) => movement.movement_type === 'ADJUSTMENT')
+    .reduce((sum, movement) => sum + Number(movement.quantity_change || 0), 0)
 
   return (
     <section className="inventory-report">
@@ -128,13 +135,17 @@ function InventoryReport({ report }) {
         </article>
 
         <article className="reports-summary-card">
-          <span>Recorded quantity increases</span>
+          <span>Goods received</span>
           <strong>{totalIn}</strong>
         </article>
 
         <article className="reports-summary-card">
-          <span>Recorded quantity decreases</span>
+          <span>Goods issued</span>
           <strong>{totalOut}</strong>
+        </article>
+        <article className="reports-summary-card">
+          <span>Net stock adjustments</span>
+          <strong>{adjustments > 0 ? '+' : ''}{adjustments}</strong>
         </article>
       </div>
 
@@ -229,9 +240,8 @@ function InventoryReport({ report }) {
         {error && <p className="reports-error">{error}</p>}
 
         <p>
-          Showing {movements.length} recorded quantity changes. Increases
-          and decreases are calculated from the old and new quantities
-          stored in the audit log.
+          Showing {movements.length} recorded movements. Receipts, physical
+          issues and stock-count adjustments are reported separately.
         </p>
 
         <div className="report-chart">

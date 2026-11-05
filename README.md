@@ -100,6 +100,16 @@ The database backup should be obtained separately from the project owner and imp
 
 Do not upload private database credentials or backups to a public repository.
 
+After importing the database, apply the Django migrations from `backend/`:
+
+```bash
+python manage.py migrate
+```
+
+The workflow migration adds tables for approval and issue history, purchase orders and receipts, item archiving, and staff account setup. It does not rewrite existing request or stock records. Legacy approved requests are flagged for Store Manager review; reviewing them does not change stock.
+
+Staff account invitations require SMTP configuration in `backend/.env`. Set `EMAIL_HOST`, `EMAIL_PORT`, `EMAIL_USE_TLS`, `EMAIL_HOST_USER`, `EMAIL_HOST_PASSWORD`, and `DEFAULT_FROM_EMAIL` to values from your mail provider. Configure `FRONTEND_URL` to the URL users will use to complete account setup. The development server's email settings must not be used as production credentials.
+
 ## Run the Backend
 
 From the backend directory:
@@ -152,3 +162,12 @@ Frontend address:
 4. Start the Django backend.
 5. Install and start the React frontend.
 6. Open `http://localhost:5173/` in your browser.
+
+## Running Backend Tests
+
+The workflow tests use an isolated in-memory SQLite database and do not modify the configured MySQL database:
+
+```bash
+cd backend
+python manage.py test inventory.tests --settings=config.test_settings
+```
