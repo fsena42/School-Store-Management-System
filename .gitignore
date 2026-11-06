@@ -34,6 +34,7 @@ Thumbs.db
 # Database backups
 *.sql
 *.sql.gz
+!database/store_management_system_schema_2026-11-06.sql
 
 # Temporary files
 *.tmp

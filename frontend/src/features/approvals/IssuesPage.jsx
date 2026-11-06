@@ -203,86 +203,119 @@ export default function IssuesPage({ onBack }) {
       {message && <p className="approvals-message" role="status">{message}</p>}
 
       {legacyReview.length > 0 && (
-        <section className="approval-card" aria-labelledby="legacy-requests-heading">
-          <h2 id="legacy-requests-heading">Legacy requests need review</h2>
-          <p>{legacyReview[0].message} Check the requester and records before confirming quantities.
-            Historical issues are documented without changing current stock.
-          </p>
-          {legacyReview.map((request) => (
-            <article key={request.request_id}>
-              <h3>Request #{request.request_id} · {request.requester} · {request.store_name}</h3>
-              <div className="approval-items">
-                {request.items.map((item) => {
-                  const values = legacyValues[request.request_id]?.[item.request_item_id] || {}
-                  return (
-                    <div className="approval-item" key={item.request_item_id}>
-                      <div className="approval-item-details">
-                        <strong>{item.item_name}</strong>
-                        <span>Requested {item.quantity_requested} · old field recorded {item.legacy_quantity_recorded}</span>
+        <section className="legacy-review-section" aria-labelledby="legacy-requests-heading">
+          <div className="legacy-review-heading">
+            <div>
+              <p className="legacy-review-eyebrow">ACTION REQUIRED</p>
+              <h2 id="legacy-requests-heading">Historical requests to verify</h2>
+              <p className="legacy-review-intro">
+                {legacyReview[0].message} Confirm quantities only after checking
+                the relevant records. This review documents history and does
+                not change current stock.
+              </p>
+            </div>
+            <span className="legacy-review-count">
+              {legacyReview.length} {legacyReview.length === 1 ? 'request' : 'requests'}
+            </span>
+          </div>
+          <div className="legacy-review-list">
+            {legacyReview.map((request) => (
+              <article className="legacy-review-card" key={request.request_id}>
+                <header className="legacy-request-header">
+                  <div>
+                    <h3>Request #{request.request_id}</h3>
+                    <p>{request.requester} <span aria-hidden="true">·</span> {request.store_name}</p>
+                  </div>
+                  <span className="legacy-review-status">Needs verification</span>
+                </header>
+                <div className="legacy-review-items">
+                  {request.items.map((item) => {
+                    const values = legacyValues[request.request_id]?.[item.request_item_id] || {}
+                    return (
+                      <div className="legacy-review-item" key={item.request_item_id}>
+                        <div className="legacy-review-item-details">
+                          <strong>{item.item_name}</strong>
+                          <span>
+                            Requested <b>{item.quantity_requested}</b>
+                            <span aria-hidden="true"> · </span>
+                            Previously recorded <b>{item.legacy_quantity_recorded}</b>
+                          </span>
+                        </div>
+                        <label className="legacy-review-field">
+                          <span>Verified approved</span>
+                          <input
+                            type="number"
+                            min="0"
+                            max={item.quantity_requested}
+                            step="1"
+                            inputMode="numeric"
+                            value={values.quantity_approved}
+                            disabled={busyId !== null}
+                            onChange={(event) => setLegacyValues((current) => ({
+                              ...current,
+                              [request.request_id]: {
+                                ...current[request.request_id],
+                                [item.request_item_id]: {
+                                  ...current[request.request_id]?.[item.request_item_id],
+                                  quantity_approved: event.target.value,
+                                },
+                              },
+                            }))}
+                          />
+                        </label>
+                        <label className="legacy-review-field">
+                          <span>Previously issued</span>
+                          <input
+                            type="number"
+                            min="0"
+                            max={values.quantity_approved || item.quantity_requested}
+                            step="1"
+                            inputMode="numeric"
+                            value={values.quantity_previously_issued}
+                            disabled={busyId !== null}
+                            onChange={(event) => setLegacyValues((current) => ({
+                              ...current,
+                              [request.request_id]: {
+                                ...current[request.request_id],
+                                [item.request_item_id]: {
+                                  ...current[request.request_id]?.[item.request_item_id],
+                                  quantity_previously_issued: event.target.value,
+                                },
+                              },
+                            }))}
+                          />
+                        </label>
                       </div>
-                      <label>
-                        Verified approved
-                        <input
-                          type="number"
-                          min="0"
-                          max={item.quantity_requested}
-                          value={values.quantity_approved}
-                          onChange={(event) => setLegacyValues((current) => ({
-                            ...current,
-                            [request.request_id]: {
-                              ...current[request.request_id],
-                              [item.request_item_id]: {
-                                ...current[request.request_id]?.[item.request_item_id],
-                                quantity_approved: event.target.value,
-                              },
-                            },
-                          }))}
-                        />
-                      </label>
-                      <label>
-                        Verified previously issued
-                        <input
-                          type="number"
-                          min="0"
-                          max={values.quantity_approved || item.quantity_requested}
-                          value={values.quantity_previously_issued}
-                          onChange={(event) => setLegacyValues((current) => ({
-                            ...current,
-                            [request.request_id]: {
-                              ...current[request.request_id],
-                              [item.request_item_id]: {
-                                ...current[request.request_id]?.[item.request_item_id],
-                                quantity_previously_issued: event.target.value,
-                              },
-                            },
-                          }))}
-                        />
-                      </label>
-                    </div>
-                  )
-                })}
-              </div>
-              <label>
-                Verification notes
-                <textarea
-                  rows={2}
-                  maxLength={1000}
-                  value={legacyReasons[request.request_id] || ''}
-                  onChange={(event) => setLegacyReasons((current) => ({
-                    ...current,
-                    [request.request_id]: event.target.value,
-                  }))}
-                />
-              </label>
-              <button
-                type="button"
-                disabled={busyId !== null}
-                onClick={() => reconcileLegacy(request)}
-              >
-                {busyId === request.request_id ? 'Saving review...' : 'Confirm verified history'}
-              </button>
-            </article>
-          ))}
+                    )
+                  })}
+                </div>
+                <div className="legacy-review-footer">
+                  <label className="legacy-review-notes">
+                    <span>Verification notes</span>
+                    <textarea
+                      rows={3}
+                      maxLength={1000}
+                      placeholder="Briefly describe the records used to verify these quantities"
+                      value={legacyReasons[request.request_id] || ''}
+                      disabled={busyId !== null}
+                      onChange={(event) => setLegacyReasons((current) => ({
+                        ...current,
+                        [request.request_id]: event.target.value,
+                      }))}
+                    />
+                  </label>
+                  <button
+                    className="legacy-review-submit"
+                    type="button"
+                    disabled={busyId !== null}
+                    onClick={() => reconcileLegacy(request)}
+                  >
+                    {busyId === request.request_id ? 'Saving review...' : 'Confirm verified history'}
+                  </button>
+                </div>
+              </article>
+            ))}
+          </div>
         </section>
       )}
 

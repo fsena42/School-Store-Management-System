@@ -21,7 +21,7 @@ export async function apiRequest(path, options = {}) {
     ...options.headers,
   }
 
-  // Django requires a CSRF token for unsafe HTTP methods.
+  // Keep unsafe requests protected when using the staff session cookie.
   if (!['GET', 'HEAD', 'OPTIONS', 'TRACE'].includes(method)) {
     headers['X-CSRFToken'] = await getCsrfToken()
   }

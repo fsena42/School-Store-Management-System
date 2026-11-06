@@ -2,8 +2,9 @@ from datetime import date
 from decimal import Decimal
 from urllib.parse import parse_qs, urlparse
 
-from django.contrib.auth import get_user_model
 from django.core import mail
+from django.contrib.auth.hashers import make_password
+from django.test import override_settings
 from django.db import connection
 from django.test import TestCase
 from rest_framework.test import APIClient
@@ -18,12 +19,12 @@ from .models import (
     Request,
     RequestItem,
     Staff,
-    StaffAccount,
     Status,
     Store,
     Supplier,
     Unit,
 )
+from .authentication import staff_principal
 
 
 LEGACY_MODELS = [
@@ -46,6 +47,8 @@ LEGACY_MODELS = [
 class StoreWorkflowTests(TestCase):
     @classmethod
     def setUpClass(cls):
+        with connection.cursor() as cursor:
+            cursor.execute("DROP TABLE IF EXISTS inventory_audit")
         with connection.schema_editor() as schema_editor:
             for model in LEGACY_MODELS:
                 schema_editor.create_model(model)
@@ -118,13 +121,16 @@ class StoreWorkflowTests(TestCase):
             positionid=self.positions[position_id],
             contact="0000000000",
         )
-        user = get_user_model().objects.create_user(
-            username=username,
-            password="test-password",
-        )
-        StaffAccount.objects.create(user=user, staff=staff)
+        principal = staff_principal({
+            "StaffID": staff.staffid,
+            "SurName": staff.surname,
+            "OtherNames": staff.othernames,
+            "PositionID": staff.positionid_id,
+            "PositionName": self.positions[position_id].positionname,
+            "IsActive": 1,
+        })
         client = APIClient()
-        client.force_authenticate(user=user)
+        client.force_authenticate(user=principal)
         return staff, client
 
     def test_workflow_tables_are_consolidated_into_existing_tables(self):
@@ -141,9 +147,9 @@ class StoreWorkflowTests(TestCase):
             "request",
             "request_item",
             "staff",
-            "inventory_audit",
         }.issubset(table_names))
         self.assertTrue({
+            "inventory_audit",
             "item_archive",
             "purchase_order",
             "purchase_order_line",
@@ -276,6 +282,19 @@ class StoreWorkflowTests(TestCase):
         req.refresh_from_db()
         self.assertEqual(self.item.quantity, 1)
         self.assertEqual(req.statusid.statusname, "Issued")
+        self.item.refresh_from_db()
+        self.assertEqual(len(self.item.audit_history), 2)
+        self.assertEqual(
+            [entry["action"] for entry in self.item.audit_history],
+            ["ISSUE", "ISSUE"],
+        )
+        report = self.principal_client.get("/api/reports/")
+        self.assertEqual(report.status_code, 200, report.data)
+        self.assertEqual(len(report.data["stock_movements"]), 2)
+        self.assertTrue(all(
+            movement["movement_type"] == "ISSUED"
+            for movement in report.data["stock_movements"]
+        ))
 
     def test_overstock_request_is_allowed_but_issue_is_limited_by_stock(self):
         req, line = self.make_request(quantity=100)
@@ -434,6 +453,11 @@ class StoreWorkflowTests(TestCase):
         self.item.refresh_from_db()
         self.assertEqual(self.item.quantity, 3)
 
+    @override_settings(
+        EMAIL_HOST="smtp.example.test",
+        DEFAULT_FROM_EMAIL="noreply@example.test",
+        FRONTEND_URL="http://localhost:5173",
+    )
     def test_staff_invitation_setup_session_and_logout(self):
         created = self.manager_client.post(
             "/api/management/staff/",
@@ -476,7 +500,21 @@ class StoreWorkflowTests(TestCase):
         self.assertEqual(signed_in.status_code, 200, signed_in.data)
         self.assertTrue(login.get("/api/session/").data["authenticated"])
         self.assertEqual(login.post("/api/logout/").status_code, 200)
-        self.assertEqual(login.get("/api/session/").status_code, 403)
+        self.assertEqual(login.get("/api/session/").status_code, 401)
+
+    def test_new_login_invalidates_the_previous_staff_session(self):
+        password = "A-very-unique-pass-92!"
+        Staff.objects.filter(pk=self.teacher.staffid).update(
+            password_hash=make_password(password),
+        )
+        first_client = APIClient()
+        second_client = APIClient()
+        credentials = {"staff_id": self.teacher.staffid, "password": password}
+
+        self.assertEqual(first_client.post("/api/login/", credentials, format="json").status_code, 200)
+        self.assertEqual(second_client.post("/api/login/", credentials, format="json").status_code, 200)
+        self.assertEqual(first_client.get("/api/session/").status_code, 401)
+        self.assertEqual(second_client.get("/api/session/").status_code, 200)
 
     def test_item_archive_waits_for_approved_issue_and_can_be_restored(self):
         req, line = self.make_request(quantity=2)
@@ -614,3 +652,4 @@ class StoreWorkflowTests(TestCase):
         self.assertEqual(second.data["purchase_order_status"], "Received")
         self.item.refresh_from_db()
         self.assertEqual(self.item.quantity, 13)
+        self.assertEqual(len(self.item.audit_history), 2)
