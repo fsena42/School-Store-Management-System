@@ -1,173 +1,143 @@
 # School Store Management System
 
-A web-based School Store Management System built using Django REST Framework, React, and MySQL.
+A web-based school-store management system for inventory, procurement, goods
+receiving, stock issuing, staff requests, approvals, staff management and
+reporting.
 
-The system helps manage school store operations, including inventory, suppliers, procurement, goods receiving, stock issuing, staff management, and reporting.
+## Technology
 
-## Technology Stack
+- **Backend:** Python 3.12, Django 5.2, Django REST Framework
+- **Frontend:** React 19, Vite 8, Recharts
+- **Database:** MySQL 8.0 with InnoDB
 
-**Backend**
-- Python
-- Django 5.2
-- Django REST Framework
-- MySQL
+The backend uses parameterized SQL for application data access. The current
+database is the submitted 13-table design; Django's default authentication,
+admin, session and migration tables are not part of the application schema.
 
-**Frontend**
-- React
-- Vite
-- Recharts
-
-## Project Structure
+## Project structure
 
 ```text
-StoreManagementSystem/
+School-Store-Management-System/
 ├── backend/
 │   ├── config/
 │   ├── inventory/
 │   ├── manage.py
 │   ├── requirements.txt
-│   ├── .env.example
-│   └── .env
+│   └── .env.example
+├── database/
+│   ├── README.md
+│   └── store_management_system_schema_2026-11-06.sql
 ├── frontend/
-│   └── frontend/
-│       ├── src/
-│       ├── public/
-│       ├── package.json
-│       └── vite.config.js
-└── .gitignore
+│   ├── src/
+│   ├── package.json
+│   └── vite.config.js
+└── report/
 ```
 
 ## Requirements
 
-Install the following before running the project:
+Install the following before running the application:
 
-- Python
-- MySQL Server
+- Python 3.12 or later
+- MySQL Server 8.0 or later
 - Node.js and npm
 - Git
 
-## Backend Setup
+## Database setup
 
-Open a terminal in the backend directory:
+Create the database and import the share-safe schema:
+
+```bash
+mysql -h 127.0.0.1 -P 3306 -u YOUR_MYSQL_USER -p \
+  -e "CREATE DATABASE store_management_system"
+mysql -h 127.0.0.1 -P 3306 -u YOUR_MYSQL_USER -p \
+  store_management_system < database/store_management_system_schema_2026-11-06.sql
+```
+
+The schema creates these 13 tables:
+
+```text
+department, grn, item, position, purchase, purchase_item,
+request, request_item, staff, status, store, supplier, unit
+```
+
+The schema-only SQL file creates structure but contains no application data.
+The full local data export is kept outside the repository at
+`~/db-backups/store_management_system-13-table-20261106.sql.gz`. It contains
+staff personal information and password hashes and must not be uploaded to a
+public repository or shared through an unsecured channel. See
+[`database/README.md`](database/README.md) for import details.
+
+## Backend setup
+
+From the project root:
 
 ```bash
 cd backend
-```
-
-Create a virtual environment:
-
-```bash
-python -m venv .venv
-```
-
-Activate it on Windows:
-
-```cmd
-.venv\Scripts\activate
-```
-
-Install Python dependencies:
-
-```bash
+python3 -m venv .venv
+source .venv/bin/activate
 python -m pip install -r requirements.txt
+cp .env.example .env
 ```
 
-Create your environment file:
+Edit `backend/.env` with the local MySQL connection values. Do not commit
+`.env`, passwords, secret keys or SMTP credentials.
 
-```cmd
-copy .env.example .env
-```
-
-Edit `.env` and configure your own Django secret key and MySQL credentials.
-
-## Database Setup
-
-Create a MySQL database named:
-
-```sql
-CREATE DATABASE store_management_system;
-```
-
-Configure the database connection in `backend/.env`.
-
-The default local configuration uses:
-
-- Database: `store_management_system`
-- Host: `127.0.0.1`
-- Port: `3307`
-
-The database backup should be obtained separately from the project owner and imported into MySQL before using the application with the existing project data.
-
-Do not upload private database credentials or backups to a public repository.
-
-After importing the database, apply the Django migrations from `backend/`:
+Start the backend:
 
 ```bash
-python manage.py migrate
-```
-
-The workflow migrations add workflow fields to the existing `item`, `purchase`, `request`, `request_item`, `staff`, and `inventory_audit` tables. Migration `0005` transfers any workflow data from the earlier auxiliary tables into those existing tables and removes the auxiliary tables. Back up the database before applying migrations. Applying these changes to an existing database still requires the schema update; importing an unchanged backup alone is not sufficient. Legacy approved requests remain flagged for Store Manager review, and reviewing them does not adjust stock.
-
-Staff account invitations require SMTP configuration in `backend/.env`. Set `EMAIL_HOST`, `EMAIL_PORT`, `EMAIL_USE_TLS`, `EMAIL_HOST_USER`, `EMAIL_HOST_PASSWORD`, and `DEFAULT_FROM_EMAIL` to values from your mail provider. Configure `FRONTEND_URL` to the URL users will use to complete account setup. The development server's email settings must not be used as production credentials.
-
-## Run the Backend
-
-From the backend directory:
-
-```bash 
 python manage.py runserver
 ```
 
-Backend address:
+The API is available at <http://127.0.0.1:8000/>.
 
-`http://127.0.0.1:8000/`
+Do **not** run `python manage.py migrate` to create the application database.
+The application schema is managed by the SQL file in `database/`; Django ORM
+and default auth tables are intentionally not used for the current design.
 
-## Frontend Setup
+## Frontend setup
 
-Open another terminal:
-
-```bash
-cd frontend/frontend
-```
-
-Install dependencies:
+In a second terminal, from the project root:
 
 ```bash
+cd frontend
 npm install
-```
-
-Start the development server:
-
-```bash
 npm run dev
 ```
 
-Frontend address:
+The frontend is available at <http://localhost:5173/>.
 
-`http://localhost:5173/`
+Keep MySQL, the backend and the frontend running while using the application.
+Open the frontend URL in a browser and sign in with an account that exists in
+the configured database.
 
-## Important Notes
+## Tests and checks
 
-- Keep the backend and frontend terminals running while using the application.
-- Each developer should maintain their own `.env` file.
-- Never commit passwords, secret keys or private database backups.
-- The database configuration must point to the correct MySQL server.
-- For a shared database, all authorised users must connect to the same hosted MySQL instance.
-
-## Running the Application
-
-1. Start the MySQL server.
-2. Ensure the database has been created and populated.
-3. Activate the backend virtual environment.
-4. Start the Django backend.
-5. Install and start the React frontend.
-6. Open `http://localhost:5173/` in your browser.
-
-## Running Backend Tests
-
-The workflow tests use an isolated in-memory SQLite database and do not modify the configured MySQL database:
+Run the isolated backend workflow tests:
 
 ```bash
 cd backend
+source .venv/bin/activate
 python manage.py test inventory.tests --settings=config.test_settings
 ```
+
+Build and lint the frontend:
+
+```bash
+cd frontend
+npm run build
+npm run lint
+```
+
+The isolated backend tests use a test database and do not modify the configured
+MySQL database.
+
+## Security and collaboration
+
+- Keep each developer's `backend/.env` local.
+- Never commit credentials, password hashes, private database dumps or
+  unredacted screenshots.
+- Use the schema-only SQL file when sharing the database structure.
+- Back up the live database before making schema or data changes.
+- All developers connecting to shared data must use the authorized MySQL
+  instance and credentials supplied separately.
