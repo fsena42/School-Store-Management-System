@@ -1,5 +1,3 @@
-import django.db.models.deletion
-from django.conf import settings
 from django.db import migrations, models
 
 
@@ -10,17 +8,6 @@ class Migration(migrations.Migration):
     ]
 
     operations = [
-        migrations.AlterField(
-            model_name="inventoryaudit",
-            name="changed_by",
-            field=models.ForeignKey(
-                blank=True,
-                null=True,
-                on_delete=models.deletion.PROTECT,
-                related_name="inventory_audit_entries",
-                to=settings.AUTH_USER_MODEL,
-            ),
-        ),
         migrations.AddField(
             model_name="inventoryaudit",
             name="changed_by_staff_id",

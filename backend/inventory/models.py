@@ -45,6 +45,7 @@ class Item(models.Model):
     archived_by_staff_id = models.IntegerField(db_column='ArchivedBy', blank=True, null=True)
     archived_at = models.DateTimeField(db_column='ArchivedAt', blank=True, null=True)
     archive_reason = models.TextField(db_column='ArchiveReason', blank=True, null=True)
+    audit_history = models.JSONField(db_column='AuditHistory', default=list)
 
     class Meta:
         managed = False
@@ -190,6 +191,12 @@ class Staff(models.Model):
     positionid = models.ForeignKey(Position, models.DO_NOTHING, db_column='PositionID', db_comment='Staff member�s position; references position')  # Field name made lowercase.
     contact = models.CharField(db_column='Contact', max_length=20, db_comment=' Staff member�s contact ')  # Field name made lowercase.
     email = models.EmailField(db_column='Email', max_length=254, blank=True, null=True, unique=True)
+    password_hash = models.CharField(db_column='PasswordHash', max_length=256, blank=True, default='!')
+    is_active = models.BooleanField(db_column='IsActive', default=True)
+    setup_token_hash = models.CharField(db_column='SetupTokenHash', max_length=64, blank=True, null=True)
+    setup_token_expires_at = models.DateTimeField(db_column='SetupTokenExpiresAt', blank=True, null=True)
+    session_token_hash = models.CharField(db_column='SessionTokenHash', max_length=64, blank=True, null=True)
+    session_expires_at = models.DateTimeField(db_column='SessionExpiresAt', blank=True, null=True)
 
     class Meta:
         managed = False
@@ -236,27 +243,6 @@ class Unit(models.Model):
         db_table = 'unit'
 
 
-from django.conf import settings
-
-class StaffAccount(models.Model):
-    user = models.OneToOneField(
-        settings.AUTH_USER_MODEL,
-        on_delete=models.CASCADE,
-        related_name="staff_account",
-    )
-
-    staff = models.OneToOneField(
-        Staff,
-        on_delete=models.PROTECT,
-        related_name="login_account",
-        db_column="StaffID",
-    )
-
-    class Meta:
-        db_table = "staff_account"
-
-
-from django.conf import settings
 from django.db import models
 
 
@@ -274,14 +260,12 @@ class InventoryAudit(models.Model):
     request_item_id = models.IntegerField(blank=True, null=True)
     quantity_delta = models.PositiveIntegerField(default=0)
 
-    changed_by = models.ForeignKey(
-        settings.AUTH_USER_MODEL,
-        on_delete=models.PROTECT,
-        related_name="inventory_audit_entries",
+    changed_by_staff_id = models.IntegerField(blank=True, null=True)
+    legacy_changed_by_user_id = models.IntegerField(
+        db_column="changed_by_id",
         blank=True,
         null=True,
     )
-    changed_by_staff_id = models.IntegerField(blank=True, null=True)
 
     changed_at = models.DateTimeField(auto_now_add=True)
 

@@ -1,7 +1,7 @@
 
 from rest_framework import serializers
-from .models import Request, RequestItem, Store, Item
 from .permissions import REQUESTABLE_STORES_BY_POSITION
+from .sql import fetch_one
 
 
 class RequestItemSerializer(serializers.Serializer):
@@ -9,7 +9,7 @@ class RequestItemSerializer(serializers.Serializer):
     quantity = serializers.IntegerField(min_value=1)
 
     def validate_item_id(self, value):
-        if not Item.objects.filter(itemid=value).exists():
+        if fetch_one("SELECT ItemID FROM item WHERE ItemID = %s", [value]) is None:
             raise serializers.ValidationError(
                 "This item does not exist."
             )
@@ -21,7 +21,7 @@ class RequestSerializer(serializers.Serializer):
     items = RequestItemSerializer(many=True, allow_empty=False)
 
     def validate_store_id(self, value):
-        if not Store.objects.filter(storeid=value).exists():
+        if fetch_one("SELECT StoreID FROM store WHERE StoreID = %s", [value]) is None:
             raise serializers.ValidationError(
                 "This store does not exist."
             )
@@ -48,25 +48,26 @@ class RequestSerializer(serializers.Serializer):
 
         # Verify that every requested item belongs to the selected store.
         for item_data in attrs["items"]:
-            item = Item.objects.filter(
-                itemid=item_data["item_id"]
-            ).first()
+            item = fetch_one(
+                "SELECT ItemID, ItemName, StoreID, IsArchived FROM item WHERE ItemID = %s",
+                [item_data["item_id"]],
+            )
 
             if item is None:
                 raise serializers.ValidationError({
                     "items": "One or more requested items do not exist."
                 })
 
-            if item.storeid_id != store_id:
+            if item["StoreID"] != store_id:
                 raise serializers.ValidationError({
                     "items": (
-                        f"Item '{item.itemname}' does not belong "
+                        f"Item '{item['ItemName']}' does not belong "
                         "to the selected store."
                     )
                 })
-            if item.is_archived:
+            if item["IsArchived"]:
                 raise serializers.ValidationError({
-                    "items": f"Archived item '{item.itemname}' cannot be requested."
+                    "items": f"Archived item '{item['ItemName']}' cannot be requested."
                 })
 
         return attrs
